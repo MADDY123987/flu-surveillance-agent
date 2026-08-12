@@ -7,17 +7,44 @@ vector-search past reports for similar situations -> ask the reasoning model to 
 and decide -> store the alert (or not) with its full reasoning trace.
 """
 
+import hashlib
 import json
+import random
 import boto3
-from app.config import AWS_REGION, BEDROCK_EMBEDDING_MODEL_ID, BEDROCK_REASONING_MODEL_ID, TARGET_REGIONS, TARGET_SIGNAL
+from app.config import (
+    AWS_REGION,
+    BEDROCK_EMBEDDING_MODEL_ID,
+    BEDROCK_REASONING_MODEL_ID,
+    MOCK_BEDROCK,
+    TARGET_REGIONS,
+    TARGET_SIGNAL,
+)
 from app.db import get_recent_signals, search_similar_reports, insert_alert
 from app.features import compute_features
 
-bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+EMBEDDING_DIMENSIONS = 1024  # matches Titan Embed Text v2 and health_reports.embedding
+
+bedrock = None if MOCK_BEDROCK else boto3.client("bedrock-runtime", region_name=AWS_REGION)
+
+
+def _mock_embed_text(text: str) -> list[float]:
+    """
+    Deterministic stand-in for Bedrock Titan embeddings, for local dev without AWS
+    credentials. Same input text always produces the same vector, so DB round-trips
+    and API wiring can be tested - but these vectors carry NO real semantic meaning
+    (unlike a real embedding model, near-identical text does not reliably produce
+    nearby mock vectors). Real Bedrock is required to judge actual search quality.
+    """
+    seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16)
+    rng = random.Random(seed)
+    return [rng.uniform(-1.0, 1.0) for _ in range(EMBEDDING_DIMENSIONS)]
 
 
 def embed_text(text: str) -> list[float]:
     """Step: turn a description of the current situation into a vector for similarity search."""
+    if MOCK_BEDROCK:
+        return _mock_embed_text(text)
+
     resp = bedrock.invoke_model(
         modelId=BEDROCK_EMBEDDING_MODEL_ID,
         body=json.dumps({"inputText": text}),
@@ -26,8 +53,52 @@ def embed_text(text: str) -> list[float]:
     return body["embedding"]
 
 
+def _mock_reason_and_decide(region: str, signal_type: str, features: dict, similar_reports: list[dict]) -> dict:
+    """
+    Deterministic stand-in for the Bedrock reasoning call, for local dev without AWS
+    credentials. Applies the same z_score thresholds a human analyst would use, so
+    alerts/watches generated this way are realistic enough to exercise the dashboard's
+    alert lifecycle and reasoning-trace UI. Real Bedrock is required for the actual
+    demo recording and for real-world use - this is not a substitute for LLM judgment.
+    """
+    z = features.get("z_score")
+    history_note = f" Closest historical report on file: \"{similar_reports[0]['title']}\"." if similar_reports else ""
+    if z is None:
+        return {
+            "meaningful_change": False,
+            "severity": "info",
+            "message": f"[MOCK_BEDROCK] Not enough baseline variance yet to compute a z-score for {signal_type} in {region}.",
+        }
+    if abs(z) >= 2:
+        return {
+            "meaningful_change": True,
+            "severity": "alert",
+            "message": (
+                f"[MOCK_BEDROCK] {signal_type} in {region} is {z:.2f} standard deviations from its recent "
+                f"baseline (latest value {features.get('latest_value')}).{history_note}"
+            ),
+        }
+    if abs(z) >= 1:
+        return {
+            "meaningful_change": True,
+            "severity": "watch",
+            "message": (
+                f"[MOCK_BEDROCK] {signal_type} in {region} is drifting from baseline (z-score {z:.2f}, "
+                f"latest value {features.get('latest_value')}).{history_note}"
+            ),
+        }
+    return {
+        "meaningful_change": False,
+        "severity": "info",
+        "message": f"[MOCK_BEDROCK] {signal_type} in {region} is within normal range (z-score {z:.2f}).",
+    }
+
+
 def reason_and_decide(region: str, signal_type: str, recent: list[dict], features: dict, similar_reports: list[dict]) -> dict:
     """Step: ask the reasoning model to compare current data against memory and decide."""
+    if MOCK_BEDROCK:
+        return _mock_reason_and_decide(region, signal_type, features, similar_reports)
+
     prompt = f"""You are a public health surveillance analyst. Review the computed statistics
 and historical context below, then decide if this warrants an alert. The statistics have
 already been calculated for you - trust them rather than recomputing from the raw data.
@@ -87,13 +158,20 @@ def run_agent_cycle(region: str, signal_type: str):
 
     # Step 4: search memory for similar past situations
     similar_reports = search_similar_reports(embedding)
-    trace["steps"].append({"step": "search_historical_context", "matches": len(similar_reports)})
+    trace["steps"].append({
+        "step": "search_historical_context",
+        "matches": len(similar_reports),
+        "matched_reports": [
+            {"title": r["title"], "published_date": r["published_date"], "distance": r["distance"]}
+            for r in similar_reports
+        ],
+    })
 
     # Step 5: reason and decide
     decision = reason_and_decide(region, signal_type, recent, features, similar_reports)
     trace["steps"].append({"step": "reason_and_decide", "decision": decision})
 
-    # Step 5: act - store the alert if warranted
+    # Step 6: act - store the alert if warranted
     if decision.get("meaningful_change"):
         insert_alert(
             signal_type=signal_type,

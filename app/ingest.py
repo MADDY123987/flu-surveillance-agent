@@ -20,7 +20,9 @@ DELPHI_BASE_URL = "https://api.delphi.cmu.edu/epidata/fluview/"
 # Delphi/CDC region codes for the states in scope. Add more here if you widen TARGET_REGIONS.
 # Full list of valid codes: https://cmu-delphi.github.io/delphi-epidata/api/geographic_codes.html
 STATE_TO_REGION_CODE = {
+    "US": "nat",
     "California": "ca",
+    "Texas": "tx",
     "New York": "ny",
 }
 
@@ -80,37 +82,64 @@ def clean_record(raw: dict) -> dict | None:
         return None
 
 
-# --- RESP-NET: COVID-19, flu, and RSV combined hospitalization rates -------------------
-# One additional CDC source that covers THREE signals at once, instead of three separate
-# fragile integrations. Dataset: "Rates of Laboratory-Confirmed RSV, COVID-19, and Flu
-# Hospitalizations from RESP-NET" on data.cdc.gov (Socrata).
+# --- RESP-NET: COVID-19 and RSV hospitalization rates -----------------------------------
+# One additional CDC source that covers two signals at once. Dataset: "Rates of
+# Laboratory-Confirmed RSV, COVID-19, and Flu Hospitalizations from the RESP-NET
+# Surveillance Systems" on data.cdc.gov (Socrata).
+# https://data.cdc.gov/Public-Health-Surveillance/Rates-of-Laboratory-Confirmed-RSV-COVID-19-and-Flu/kvib-3txy
 #
-# TODO: go to data.cdc.gov, search "RESP-NET", open the dataset, click "API" to get the
-# real resource ID and confirm these field names, then fill in below.
-RESPNET_RESOURCE_ID = "REPLACE_ME"  # e.g. "abcd-1234", from the dataset's API tab
+# Confirmed via a live query against the dataset (2026-08-12):
+# - surveillance_network values: 'FluSurv-NET', 'COVID-NET', 'RSV-NET', 'Combined'
+#   (flu is already covered by Delphi/ILINet above, so FluSurv-NET is not used here)
+# - state field holds full state names (e.g. 'California'); the national aggregate
+#   row uses state='Overall', not a state name
+# - date field is just 'date' (week-ending date), not 'week_ending_date'
+# - rate value is in 'estimate' (returned as a string), not 'rate'
+# - data_type must be filtered to 'Weekly Rate' (the dataset also has cumulative-season
+#   rates, deaths, ICU admission, and ventilation rows mixed into the same table)
+# - age_category must be filtered to 'Overall' (dataset also has many age-bracket rows)
+# - rate_type filtered to 'Observed' (vs. 'Age-Adjusted' / 'Estimated')
+# - sex and race must ALSO be filtered to 'All' each - even within age_category='Overall'
+#   the table has separate rows broken out by sex and by race, so omitting these filters
+#   returns multiple duplicate-looking rows per date
+# - IMPORTANT: RESP-NET's catchment is a subset of states, not all 50 - Texas is NOT a
+#   participating site for COVID-NET or RSV-NET. Of our 4 locked regions, only
+#   California and New York (plus the 'Overall' national aggregate) have RESP-NET data;
+#   Texas will only ever have the ILINet flu signal. This is a real data-availability
+#   gap, not a bug - fetch_respnet_data() returns [] for unmapped regions rather than
+#   erroring, and run_ingest() just stores fewer records for Texas.
+RESPNET_RESOURCE_ID = "kvib-3txy"
 RESPNET_BASE_URL = f"https://data.cdc.gov/resource/{RESPNET_RESOURCE_ID}.json"
 
-# Map our signal_type values to whatever the dataset calls each disease/network -
-# confirm exact values once you've pulled a sample row (surveillance network field).
 RESPNET_SIGNAL_MAP = {
-    "covid19_hospitalization": "COVID-19-NET",
+    "covid19_hospitalization": "COVID-NET",
     "rsv_hospitalization": "RSV-NET",
-    # flu is already covered by Delphi/ILINet above, so not duplicated here
+}
+
+# Our TARGET_REGIONS values -> this dataset's 'state' field values.
+RESPNET_REGION_MAP = {
+    "US": "Overall",
+    "California": "California",
+    "New York": "New York",
+    # Texas intentionally omitted - not a RESP-NET catchment state, see note above.
 }
 
 
 def fetch_respnet_data(region: str, network_label: str) -> list[dict]:
     """Pull recent RESP-NET hospitalization rates for one disease network + region."""
-    if RESPNET_RESOURCE_ID == "REPLACE_ME":
-        raise NotImplementedError(
-            "Fill in RESPNET_RESOURCE_ID at the top of app/ingest.py - see the TODO comment"
-        )
+    respnet_state = RESPNET_REGION_MAP.get(region)
+    if respnet_state is None:
+        return []  # region has no RESP-NET catchment site - expected, not an error
 
     resp = requests.get(
         RESPNET_BASE_URL,
         params={
-            "$where": f"surveillance_network='{network_label}' AND state='{region}'",
-            "$order": "week_ending_date DESC",
+            "$where": (
+                f"surveillance_network='{network_label}' AND state='{respnet_state}' "
+                "AND data_type='Weekly Rate' AND age_category='Overall' AND rate_type='Observed' "
+                "AND sex='All' AND race='All'"
+            ),
+            "$order": "date DESC",
             "$limit": 12,
         },
         timeout=15,
@@ -121,9 +150,9 @@ def fetch_respnet_data(region: str, network_label: str) -> list[dict]:
     records = []
     for row in rows:
         try:
-            records.append({"date": row["week_ending_date"][:10], "value": row["rate"]})
-        except KeyError:
-            continue  # field names not confirmed yet - see TODO above
+            records.append({"date": row["date"][:10], "value": float(row["estimate"])})
+        except (KeyError, ValueError, TypeError):
+            continue
     return records
 
 

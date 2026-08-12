@@ -1,3 +1,4 @@
+import json
 from sqlalchemy import create_engine, text
 from app.config import DATABASE_URL
 
@@ -11,14 +12,14 @@ def log_audit(actor: str, action: str, resource: str, details: dict | None = Non
             text(
                 """
                 INSERT INTO audit_log (actor, action, resource, details)
-                VALUES (:actor, :action, :resource, :details)
+                VALUES (:actor, :action, :resource, CAST(:details AS JSONB))
                 """
             ),
             {
                 "actor": actor,
                 "action": action,
                 "resource": resource,
-                "details": details or {},
+                "details": json.dumps(details or {}),
             },
         )
 
@@ -62,6 +63,11 @@ def get_recent_signals(signal_type: str, region: str, limit: int = 12) -> list[d
     return [{"date": str(r[0]), "value": r[1]} for r in rows][::-1]  # oldest -> newest
 
 
+def _vector_literal(embedding: list[float]) -> str:
+    """CockroachDB's VECTOR type takes a string literal like '[1.0,0.0,...]', not a raw list."""
+    return "[" + ",".join(str(v) for v in embedding) + "]"
+
+
 def insert_report(source: str, title: str, content: str, region: str, published_date: str, embedding: list[float]):
     with engine.begin() as conn:
         conn.execute(
@@ -77,27 +83,28 @@ def insert_report(source: str, title: str, content: str, region: str, published_
                 "content": content,
                 "region": region,
                 "published_date": published_date,
-                "embedding": embedding,
+                "embedding": _vector_literal(embedding),
             },
         )
+    log_audit("seed_job", "write", f"health_reports:{region}:{title}", {"source": source})
 
 
-def search_similar_reports(embedding: list[float], limit: int = 3) -> list[dict]:
+def search_similar_reports(embedding: list[float], limit: int = 3, actor: str = "agent") -> list[dict]:
     """Vector similarity search over past reports - the 'has this happened before' query."""
     with engine.begin() as conn:
         rows = conn.execute(
             text(
                 """
-                SELECT title, content, published_date
+                SELECT title, content, published_date, embedding <-> :embedding AS distance
                 FROM health_reports
-                ORDER BY embedding <-> :embedding
+                ORDER BY distance
                 LIMIT :limit
                 """
             ),
-            {"embedding": embedding, "limit": limit},
+            {"embedding": _vector_literal(embedding), "limit": limit},
         ).fetchall()
-    log_audit("agent", "read", "health_reports:vector_search", {"results": len(rows)})
-    return [{"title": r[0], "content": r[1], "published_date": str(r[2])} for r in rows]
+    log_audit(actor, "read", "health_reports:vector_search", {"results": len(rows)})
+    return [{"title": r[0], "content": r[1], "published_date": str(r[2]), "distance": r[3]} for r in rows]
 
 
 def insert_alert(signal_type: str, region: str, severity: str, message: str, reasoning: dict) -> str:
@@ -107,7 +114,7 @@ def insert_alert(signal_type: str, region: str, severity: str, message: str, rea
             text(
                 """
                 INSERT INTO alerts (signal_type, region, severity, message, agent_reasoning, state)
-                VALUES (:signal_type, :region, :severity, :message, :reasoning, 'new')
+                VALUES (:signal_type, :region, :severity, :message, CAST(:reasoning AS JSONB), 'new')
                 RETURNING id
                 """
             ),
@@ -116,7 +123,7 @@ def insert_alert(signal_type: str, region: str, severity: str, message: str, rea
                 "region": region,
                 "severity": severity,
                 "message": message,
-                "reasoning": reasoning,
+                "reasoning": json.dumps(reasoning),
             },
         ).fetchone()
         alert_id = str(row[0])

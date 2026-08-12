@@ -260,10 +260,18 @@ CREATE TABLE audit_log (
 ## 7. API surface (FastAPI, `app/main.py`)
 
 - `GET /health` — liveness check
+- `GET /` — redirects to `/dashboard/`
+- `GET /dashboard/` — static dashboard (`app/static/index.html`)
 - `GET /signals/{signal_type}/{region}` — recent time series for one signal/region
 - `GET /rankings` — every region/signal combo ranked by |z-score|, most anomalous
   first — the "top emerging risks" view
-- `GET /alerts` — recent alerts
+- `GET /reports/search?q=<text>` — semantic search over `health_reports` via
+  CockroachDB vector index; returns top-k matches with distance/similarity
+- `GET /regions/{region}/closest-match?signal_type=<type>` — cross-region pattern
+  match: closest historical snapshot among the other regions, by embedding
+  distance (on-demand, not part of periodic refresh — see section 12)
+- `GET /alerts` — recent alerts, including `state` and the full `agent_reasoning`
+  trace
 - `POST /alerts/{alert_id}/transition` — move an alert through its lifecycle
 - `GET /alerts/{alert_id}/history` — full state-transition history for one alert
 - `GET /audit` — recent audit log entries
@@ -288,35 +296,118 @@ confirms the ILINet ingestion path works end to end against the live API.
 
 ## 9. Current build status
 
+_Updated 2026-08-13 after (a) a pass through setup steps 3-8, 11 that didn't need
+CockroachDB Cloud / AWS console / GitHub access, then (b) standing up a **local**
+CockroachDB via Docker (not Cloud) to actually run the ingest job and API end-to-end
+against real data. No scope was changed; section 3's decision history is untouched._
+
 **Already built and compiling cleanly:**
-- Project structure, `requirements.txt`, `.env.example`
+- Project structure, `requirements.txt` (now includes `sqlalchemy-cockroachdb` and
+  `beautifulsoup4`, see fixes below), `.env.example` (was referenced but missing —
+  created; documents the `cockroachdb+psycopg://` URL scheme requirement)
 - `app/schema.sql` — full schema as above
-- `app/config.py` — env var loading
+- `app/config.py` — env var loading; `TARGET_REGIONS` default now covers all 4 locked
+  regions (was just "California")
 - `app/db.py` — all CockroachDB read/write functions, including audit logging on
   every read/write, and alert state transition logic
 - `app/features.py` — z-score and week-over-week % change computation
-- `app/ingest.py` — real, working ILINet fetch (`fetch_cdc_data`); RESP-NET fetch
-  scaffolded but needs the real resource ID filled in
-  (`RESPNET_RESOURCE_ID = "REPLACE_ME"`)
+- `app/ingest.py` — real, working ILINet fetch (`fetch_cdc_data`) for all 4 regions
+  (`nat`/`ca`/`tx`/`ny`, all confirmed live); RESP-NET fetch fully wired to the real
+  resource ID (`kvib-3txy`) and confirmed field names
+- `app/fluview.py` — **new.** FluView weekly narrative scraper, confirmed working
+  against the live site
+- `app/seed_reports.py` — **new.** Seeds `health_reports` from recent FluView reports
+  + Bedrock embeddings (idempotent re-runs)
 - `app/agent.py` — full 5-step agent loop, calls Bedrock directly via boto3
-- `app/main.py` — all API endpoints listed above, including `/rankings`
+- `app/main.py` — all API endpoints listed above, including `/rankings`, plus a
+  `/dashboard` static mount and `/` redirect
+- `app/static/index.html` — **new.** Dashboard: stat tiles, rankings bar chart, signal
+  trend line chart, alerts table (with ack/resolve actions), audit trail
 - `lambda_handler.py` — Lambda entrypoint for scheduled ingestion
 
-**Not yet built:**
-- RESP-NET real resource ID + field name confirmation
-- FluView narrative text scraper (HTML fetch + text extraction + embedding)
-- CockroachDB cluster (needs to be created in the Cloud Console)
-- AWS Bedrock model access (needs to be enabled in the AWS console — do this
-  early, approval can lag)
+**Bugs found and fixed during this pass (not scope changes — the code didn't match
+its own documented design):**
+- `app/agent.py` — `run_agent_cycle()` never called `compute_features()` and called
+  `reason_and_decide()` with one fewer argument than its signature. The agent would
+  have crashed on first real run. Fixed: features are now computed and passed through.
+- `app/db.py` — `insert_report()` / `search_similar_reports()` passed a raw Python
+  list as the `VECTOR` bind parameter; CockroachDB's VECTOR type requires a string
+  literal (`'[1.0,2.0,...]'`). Fixed with a `_vector_literal()` helper.
+- `app/db.py` — `log_audit()` / `insert_alert()` passed a raw Python `dict` as a
+  `JSONB` bind parameter; psycopg3 can't auto-adapt that. Found by actually running
+  `app/ingest.py` against a real DB (every ingested row logs an audit entry, so this
+  broke on the very first insert). Fixed with `json.dumps(...)` +
+  `CAST(:param AS JSONB)` — note plain `:param::JSONB` doesn't work either, since
+  SQLAlchemy's `text()` bind-param parser trips on a `::` immediately following a
+  named param.
+- `requirements.txt` was missing `sqlalchemy-cockroachdb` (needed for the
+  `cockroachdb://` dialect) and `beautifulsoup4` (needed for the FluView scraper).
+
+**Data-availability gaps discovered (not bugs — real constraints of the sources,
+found by actually running the ingest job against live APIs):**
+- RESP-NET's catchment is a subset of states. Texas is **not** a COVID-NET/RSV-NET
+  site — of the 4 locked regions, only US/California/New York have RESP-NET data;
+  Texas will only ever have the ILINet flu signal. Handled gracefully in
+  `fetch_respnet_data()` (returns `[]` for unmapped regions rather than erroring).
+- As of 2026-08-13, Delphi/ILINet's most recent data point for New York is epiweek
+  202539 (~Sept 2025) — New York currently has **no recent flu_like_illness signal**
+  via ILINet (last confirmed real ingest run: 0 flu rows for NY, vs 6 each for
+  US/California/Texas). New York's RESP-NET (COVID/RSV) data is fine and current.
+  This may resolve on its own as CDC catches up reporting, or may not before the
+  deadline — worth knowing before recording the demo video so New York isn't shown
+  as the "everything's flat" example. `app/ingest.py` already handles it gracefully
+  (logs "no results", doesn't crash, doesn't drop other regions).
+
+**Verified against a real local CockroachDB (Docker, single-node, NOT Cloud — see
+new "Local development" note in section 10):**
+- `app/schema.sql` applies cleanly, all 5 tables + the vector index created
+- `python -m app.ingest` run for real against live Delphi + RESP-NET APIs: 90 rows
+  stored, 90 matching audit_log rows (confirms audit-on-every-write is real, not
+  just documented)
+- `GET /rankings`, `GET /signals/{signal}/{region}`, `GET /audit`, `GET /alerts`,
+  `GET /dashboard/` all confirmed returning real correctly-shaped data through
+  `uvicorn` — the dashboard's fetch calls match the live API response shapes exactly
+- Still unverified: `app/agent.py` and `app/seed_reports.py` (both need real AWS
+  Bedrock access), and the dashboard in an actual browser (no browser tool available
+  this session — only curl-level verification so far)
+
+**Not yet built / needs an external account (see section 10 for exact steps):**
+- CockroachDB **Cloud** cluster (a local Docker instance now exists for dev — see
+  section 10 — but the Cloud cluster is still required for deployment/submission)
+- AWS Bedrock model access (needs to be enabled in the AWS console)
+- Running `app/seed_reports.py` and `python -m app.agent` for real — both need
+  Bedrock; code is written and import-clean but genuinely untested end-to-end
+- Viewing `app/static/index.html` in an actual browser against real data (verified
+  it serves correctly and degrades gracefully with no DB; a live look with real
+  rankings/alerts data is still worth doing once data exists)
+- ccloud CLI install/auth against the real cluster
 - Lambda deployment + EventBridge schedule (local code exists, not yet deployed)
-- Dashboard / frontend
 - Demo video
-- Seed script for initial historical report embeddings (needed before vector
-  search has anything to find)
+- Push to the public GitHub repo, Devpost submission
 
 ---
 
 ## 10. Setup steps (for whoever picks this up)
+
+### Local development (no CockroachDB Cloud / AWS account needed)
+
+Everything except real Bedrock calls (embeddings + agent reasoning) can be developed
+and tested against a **local, single-node CockroachDB in Docker** — not a substitute
+for the Cloud cluster required at submission time, but lets you iterate on schema/
+ingest/API/dashboard work immediately:
+
+```
+docker run -d --name crdb-local -p 26257:26257 -p 8080:8080 \
+  cockroachdb/cockroach:latest start-single-node --insecure --store=type=mem,size=0.25
+docker exec crdb-local ./cockroach sql --insecure -e "CREATE DATABASE IF NOT EXISTS outbreak;"
+docker cp app/schema.sql crdb-local:/schema.sql
+docker exec crdb-local ./cockroach sql --insecure --database=outbreak -f /schema.sql
+```
+
+Then set `DATABASE_URL=cockroachdb+psycopg://root@localhost:26257/outbreak?sslmode=disable`
+in `.env` (already done in the current `.env` in this checkout). `python -m app.ingest`
+and the FastAPI app/dashboard all work fully against this — confirmed 2026-08-13 (see
+section 9). Swap `DATABASE_URL` for the real Cloud connection string before deploying.
 
 1. Create a free CockroachDB Cloud cluster (cockroachlabs.cloud), AWS as provider.
    Run `app/schema.sql` against it.
@@ -346,3 +437,87 @@ more generic names to stay honest about current scope (flu is the most complete
 signal; COVID/RSV/text are in progress). Description used: an agent that ingests
 CDC flu surveillance data, remembers historical patterns in CockroachDB, and
 generates auditable alerts using Bedrock reasoning.
+
+---
+
+## 12. Frontend & feature additions
+
+_Completed 2026-08-13, implementing `NEXT_STEPS.md` in order. Everything here is
+inside the locked scope from section 3 — no new data sources, no new regions, no
+new cloud dependencies beyond Bedrock (already required). Nothing in section 3
+was reopened._
+
+**`MOCK_BEDROCK` flag (`app/config.py`, `app/agent.py`) — built first since
+everything else depended on it:** when `MOCK_BEDROCK=true`, `embed_text()` returns
+a deterministic hash-seeded vector and `reason_and_decide()` applies the same
+z-score thresholds a human analyst would, instead of calling AWS. This let the
+*entire* pipeline — ingest → agent reasoning → vector search → alert storage →
+dashboard — be exercised locally and verified against real CockroachDB data,
+without AWS credentials. Real Bedrock is required for actual semantic quality;
+mock vectors carry no real meaning (documented in code). Confirmed working:
+`python -m app.agent` and `python -m app.seed_reports` both ran end-to-end
+locally, producing real alerts with real vector-search matches.
+
+**One more real bug found during full-pipeline reruns:** `db.insert_report()` never
+called `log_audit()`, unlike every other write function in `db.py` — silently
+breaking the project's own stated design ("audit_log: every agent read/write").
+`seed_reports.py`'s writes were going completely unaudited except for its own
+job-level summary line. Fixed: `insert_report()` now logs a per-row audit entry
+(actor `seed_job`), verified by actor-grouped count after a full clean rerun.
+
+**Dashboard polish (section 1 of NEXT_STEPS.md):**
+- Data-gap badges: the two known gaps (Texas has no RESP-NET COVID/RSV data; New
+  York has no recent ILINet flu data) now show as a labeled amber "data gap"
+  note when that region/signal combo is selected in the trend chart, not a bare
+  "no data" state.
+- `agent_reasoning` is now returned by `GET /alerts` (previously omitted from the
+  SELECT) and rendered as an expandable per-alert trace in the dashboard: signal
+  history count, computed z-score/WoW change, the embedded situation text, which
+  historical report(s) vector search matched (title + published date + distance —
+  `app/agent.py`'s trace previously only recorded a match *count*, not which
+  reports; fixed so this is actually showable), and the decision. Expanded rows
+  survive the dashboard's 30s auto-refresh (tracked in a JS `Set`) so an open
+  trace doesn't snap shut mid-demo.
+- Alerts table now also shows each alert's lifecycle `state` and only offers
+  the Ack/Resolve actions that are valid from that state (previously always
+  showed both regardless of current state).
+- Loading states added to all dashboard fetch calls (previously only had error
+  states).
+
+**Semantic search box (section 2, highest-priority new feature):**
+- `GET /reports/search?q=<text>` (`app/main.py`) — embeds the query, runs a real
+  CockroachDB vector search over `health_reports`, returns top-k matches with
+  `distance` (raw L2 `<->` distance) and `similarity_pct` (a display-only
+  monotonic transform, not a calibrated percentage — documented as such in code).
+  `db.search_similar_reports()` now also returns `distance` and takes an `actor`
+  param so dashboard-triggered searches log as `dashboard_search` in the audit
+  trail, distinct from the agent's own internal searches.
+- Dashboard: a full-width search box at the top of the page, wired to the new
+  endpoint, showing title/date/similarity/snippet per result.
+
+**Cross-region pattern match (section 3, optional stretch — implemented since
+Titan embedding calls are inexpensive, not the cost concern originally assumed):**
+- `GET /regions/{region}/closest-match?signal_type=<type>` (`app/patterns.py`,
+  new file) — compares a region's current signal snapshot against a rolling
+  window of every *other* region's recent snapshots (embedding each on the fly,
+  no new table), returns the closest match by embedding distance. On-demand only
+  (a dashboard button, not part of the periodic refresh) since it makes several
+  Bedrock calls per request. Correctly returns `closest_match: null` for regions
+  with a known data gap rather than erroring (verified: Texas/COVID and
+  New York/flu both return null; Texas/flu correctly found a real match).
+
+**Verification done without a real cluster/AWS, using the local Docker
+CockroachDB from section 10:**
+- Full pipeline re-run end-to-end with `MOCK_BEDROCK=true`: ingest → agent →
+  alerts → dashboard, all against real CockroachDB data
+- Every new/changed endpoint hit directly and confirmed 200 with correctly
+  shaped data: `/reports/search`, `/regions/{region}/closest-match`, updated
+  `/alerts` (now includes `state` + `agent_reasoning`)
+- `app/static/index.html` statically verified: JS syntax check, HTML tag-balance
+  check, and a cross-check that every `getElementById` call resolves to a
+  declared element — all clean
+- **Not verified:** an actual browser render. No browser tool was available this
+  session (declined earlier in the conversation). Chart rendering, layout at
+  narrow widths, and interaction polish (hover tooltips, expand/collapse
+  animation) should still get one real look in a browser before the demo
+  recording — the static checks above catch structural bugs, not visual ones.

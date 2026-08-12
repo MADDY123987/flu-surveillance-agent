@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outbreak Intelligence Agent</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6;
+    --seq-250:        #86b6ef;
+    --seq-350:        #5598e7;
+    --seq-450:        #2a78d6;
+    --seq-550:        #1c5cab;
+    --seq-650:        #104281;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --serious:        #ec835a;
+    --critical:       #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --seq-250:        #184f95;
+      --seq-350:        #1c5cab;
+      --seq-450:        #2a78d6;
+      --seq-550:        #3987e5;
+      --seq-650:        #86b6ef;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+  header p { margin: 0; color: var(--text-secondary); font-size: 13px; }
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 24px;
+    display: grid;
+    gap: 20px;
+    grid-template-columns: repeat(12, 1fr);
+  }
+  .card {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }
+  .card h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+  .card .sub { margin: 0 0 14px; color: var(--text-muted); font-size: 12px; }
+  .stat-row { grid-column: span 12; display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .stat-tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .stat-tile .label { color: var(--text-secondary); font-size: 12px; margin-bottom: 6px; }
+  .stat-tile .value { font-size: 26px; font-weight: 600; font-variant-numeric: proportional-nums; }
+  .col-7 { grid-column: span 7; }
+  .col-5 { grid-column: span 5; }
+  .col-12 { grid-column: span 12; }
+  @media (max-width: 860px) { .col-7, .col-5, .stat-row { grid-column: span 12; } .stat-row { grid-template-columns: repeat(2, 1fr); } }
+
+  select, button {
+    font: inherit;
+    color: var(--text-primary);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 9px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--text-secondary); }
+  .controls { display: flex; gap: 8px; margin-bottom: 12px; }
+
+  .rank-row { display: grid; grid-template-columns: 130px 1fr 56px; align-items: center; gap: 10px; padding: 5px 0; }
+  .rank-row .label { color: var(--text-secondary); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rank-row .bar-track { height: 20px; background: var(--page); border-radius: 4px; position: relative; }
+  .rank-row .bar-fill { height: 20px; border-radius: 4px; }
+  .rank-row .zval { text-align: right; font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+  svg.chart { width: 100%; height: 220px; display: block; overflow: visible; }
+  .tooltip {
+    position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    display: none; white-space: nowrap; z-index: 10;
+  }
+  .chart-wrap { position: relative; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.02em; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px 2px 6px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .badge.info { color: var(--good); background: color-mix(in srgb, var(--good) 14%, transparent); }
+  .badge.info .dot { background: var(--good); }
+  .badge.watch { color: var(--warning); background: color-mix(in srgb, var(--warning) 18%, transparent); }
+  .badge.watch .dot { background: var(--warning); }
+  .badge.alert { color: var(--critical); background: color-mix(in srgb, var(--critical) 14%, transparent); }
+  .badge.alert .dot { background: var(--critical); }
+
+  .state-pill { font-size: 11px; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; white-space: nowrap; }
+  .empty { color: var(--text-muted); font-size: 12px; padding: 10px 0; }
+  .row-actions { display: flex; gap: 6px; }
+  .row-actions button { font-size: 11px; padding: 3px 7px; }
+
+  .badge.gap { color: var(--warning); background: color-mix(in srgb, var(--warning) 18%, transparent); }
+  .badge.gap .dot { background: var(--warning); }
+  .gap-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 12px; padding: 8px 10px; background: color-mix(in srgb, var(--warning) 10%, transparent); border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent); border-radius: 8px; font-size: 11px; color: var(--text-secondary); }
+  .gap-note strong { color: var(--text-primary); }
+
+  tr.alert-row { cursor: pointer; }
+  tr.alert-row:hover { background: color-mix(in srgb, var(--text-primary) 3%, transparent); }
+  .reasoning { margin: 4px 0 12px; padding: 12px 14px; background: var(--page); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
+  .reasoning .step { display: grid; grid-template-columns: 150px 1fr; gap: 4px 10px; padding: 4px 0; border-bottom: 1px solid var(--grid); }
+  .reasoning .step:last-child { border-bottom: none; }
+  .reasoning .step .k { color: var(--text-muted); }
+  .reasoning .step .v { color: var(--text-primary); }
+  .chevron { display: inline-block; transition: transform 0.15s; color: var(--text-muted); }
+  .chevron.open { transform: rotate(90deg); }
+
+  .search-row { display: flex; gap: 8px; margin-bottom: 14px; }
+  .search-row input { flex: 1; font: inherit; color: var(--text-primary); background: var(--page); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; }
+  .search-result { padding: 10px 0; border-bottom: 1px solid var(--grid); }
+  .search-result:last-child { border-bottom: none; }
+  .search-result .head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .search-result .title { font-weight: 600; font-size: 13px; }
+  .search-result .score { color: var(--text-muted); font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .search-result .snippet { color: var(--text-secondary); font-size: 12px; margin-top: 4px; }
+
+  .match-result { margin-top: 10px; padding: 10px 12px; background: var(--page); border: 1px solid var(--border); border-radius: 8px; font-size: 12px; color: var(--text-secondary); }
+  .match-result strong { color: var(--text-primary); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Outbreak Intelligence Agent</h1>
+  <p>CDC respiratory surveillance, remembered and reasoned over in CockroachDB</p>
+</header>
+
+<main>
+  <div class="stat-row" id="stat-tiles"></div>
+
+  <div class="card col-12">
+    <h2>Search past reports</h2>
+    <p class="sub">Semantic search over CDC FluView narrative reports — CockroachDB's vector index at work</p>
+    <div class="search-row">
+      <input type="text" id="search-input" placeholder="e.g. &quot;influenza activity increasing nationally&quot;">
+      <button id="search-button">Search</button>
+    </div>
+    <div id="search-results"></div>
+  </div>
+
+  <div class="card col-7">
+    <h2>Top emerging risks</h2>
+    <p class="sub">Every region/signal combination ranked by |z-score| vs its own recent baseline</p>
+    <div id="rankings"></div>
+  </div>
+
+  <div class="card col-5">
+    <h2>Signal trend</h2>
+    <p class="sub" id="trend-sub">Recent readings for the selected region and signal</p>
+    <div class="controls">
+      <select id="trend-signal"></select>
+      <select id="trend-region"></select>
+    </div>
+    <div class="chart-wrap">
+      <svg class="chart" id="trend-chart" viewBox="0 0 460 220" preserveAspectRatio="none"></svg>
+      <div class="tooltip" id="trend-tooltip"></div>
+    </div>
+    <div id="trend-gap-note"></div>
+    <div class="controls" style="margin-top:14px">
+      <button id="match-button">Find closest historical match</button>
+    </div>
+    <div id="match-result"></div>
+  </div>
+
+  <div class="card col-7">
+    <h2>Alerts</h2>
+    <p class="sub">Agent-generated alerts, most recent first — click a row to view its state history</p>
+    <div id="alerts"></div>
+  </div>
+
+  <div class="card col-5">
+    <h2>Audit trail</h2>
+    <p class="sub">Every agent read/write, most recent first</p>
+    <div id="audit"></div>
+  </div>
+</main>
+
+<script>
+const SIGNAL_TYPES = ["flu_like_illness", "covid19_hospitalization", "rsv_hospitalization"];
+const REGIONS = ["US", "California", "Texas", "New York"];
+const SEQ_STEPS = ["var(--seq-250)", "var(--seq-350)", "var(--seq-450)", "var(--seq-550)", "var(--seq-650)"];
+
+// Known, documented coverage gaps in the underlying CDC sources - not bugs. Surfaced
+// as visible product behavior rather than left for a viewer to discover as an
+// apparent error. See HANDOFF.md section 9.
+const KNOWN_GAPS = {
+  "Texas:covid19_hospitalization": "Texas is not a RESP-NET catchment state, so it has no COVID-19 hospitalization data — only its flu signal is available.",
+  "Texas:rsv_hospitalization": "Texas is not a RESP-NET catchment state, so it has no RSV hospitalization data — only its flu signal is available.",
+  "New York:flu_like_illness": "Delphi/ILINet's most recent New York report is from ~Sept 2025 — no current flu signal is available for New York right now. This is an upstream CDC reporting gap, not a bug.",
+};
+function gapKey(region, signalType) { return `${region}:${signalType}`; }
+
+async function getJSON(url, opts) {
+  const resp = await fetch(url, opts);
+  if (!resp.ok) throw new Error(`${url} -> ${resp.status}`);
+  return resp.json();
+}
+
+function seqColorForRank(i, n) {
+  const bucket = Math.min(SEQ_STEPS.length - 1, Math.floor((i / Math.max(1, n)) * SEQ_STEPS.length));
+  return SEQ_STEPS[bucket];
+}
+
+function severityBadge(sev) {
+  if (sev === "gap") return `<span class="badge gap"><span class="dot"></span>data gap</span>`;
+  const cls = sev === "alert" ? "alert" : sev === "watch" ? "watch" : "info";
+  return `<span class="badge ${cls}"><span class="dot"></span>${sev}</span>`;
+}
+
+// ---- stat tiles -----------------------------------------------------------
+async function loadStatTiles() {
+  const el = document.getElementById("stat-tiles");
+  if (!el.children.length) el.innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const [alerts, audit] = await Promise.all([getJSON("/alerts?limit=100"), getJSON("/audit?limit=1")]);
+    const active = alerts.filter(a => a.severity === "alert").length;
+    const watch = alerts.filter(a => a.severity === "watch").length;
+    const lastAudit = audit[0] ? new Date(audit[0].created_at).toLocaleString() : "—";
+    el.innerHTML = `
+      <div class="stat-tile"><div class="label">Regions monitored</div><div class="value">${REGIONS.length}</div></div>
+      <div class="stat-tile"><div class="label">Signals tracked</div><div class="value">${SIGNAL_TYPES.length}</div></div>
+      <div class="stat-tile"><div class="label">Active alerts</div><div class="value" style="color:var(--critical)">${active}</div></div>
+      <div class="stat-tile"><div class="label">Watch-level alerts</div><div class="value" style="color:var(--warning)">${watch}</div></div>
+    `;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not load stats (${e.message})</div>`;
+  }
+}
+
+// ---- rankings ---------------------------------------------------------
+async function loadRankings() {
+  const el = document.getElementById("rankings");
+  if (!el.innerHTML) el.innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const rows = await getJSON("/rankings");
+    if (!rows.length) { el.innerHTML = `<div class="empty">No ranked signals yet — run an ingest cycle first.</div>`; return; }
+    const top = rows.slice(0, 10);
+    const maxAbs = Math.max(...top.map(r => Math.abs(r.z_score)), 1);
+    el.innerHTML = top.map((r, i) => {
+      const pct = Math.min(100, (Math.abs(r.z_score) / maxAbs) * 100);
+      const color = seqColorForRank(i, top.length);
+      return `
+        <div class="rank-row">
+          <div class="label">${r.region} · ${r.signal_type.replace(/_/g, " ")}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${pct}%; background:${color}"></div></div>
+          <div class="zval">${r.z_score.toFixed(2)}</div>
+        </div>`;
+    }).join("");
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not load rankings (${e.message})</div>`;
+  }
+}
+
+// ---- trend chart --------------------------------------------------------
+function drawTrend(points) {
+  const svg = document.getElementById("trend-chart");
+  const tooltip = document.getElementById("trend-tooltip");
+  const W = 460, H = 220, padL = 40, padR = 12, padT = 12, padB = 24;
+  svg.innerHTML = "";
+  if (!points.length) {
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--text-muted)" font-size="12">No data yet</text>`;
+    return;
+  }
+  const values = points.map(p => p.value);
+  const minV = Math.min(...values, 0);
+  const maxV = Math.max(...values, 1);
+  const x = i => padL + (i / Math.max(1, points.length - 1)) * (W - padL - padR);
+  const y = v => padT + (1 - (v - minV) / Math.max(1e-9, (maxV - minV))) * (H - padT - padB);
+
+  const ns = "http://www.w3.org/2000/svg";
+  const g = document.createElementNS(ns, "g");
+
+  // gridlines (4 steps)
+  for (let s = 0; s <= 3; s++) {
+    const v = minV + (s / 3) * (maxV - minV);
+    const gy = y(v);
+    const line = document.createElementNS(ns, "line");
+    line.setAttribute("x1", padL); line.setAttribute("x2", W - padR);
+    line.setAttribute("y1", gy); line.setAttribute("y2", gy);
+    line.setAttribute("stroke", "var(--grid)"); line.setAttribute("stroke-width", "1");
+    g.appendChild(line);
+    const label = document.createElementNS(ns, "text");
+    label.setAttribute("x", padL - 6); label.setAttribute("y", gy + 3);
+    label.setAttribute("text-anchor", "end"); label.setAttribute("font-size", "10");
+    label.setAttribute("fill", "var(--text-muted)");
+    label.textContent = v.toFixed(1);
+    g.appendChild(label);
+  }
+
+  // line
+  const d = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i)},${y(p.value)}`).join(" ");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", d);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "var(--series-1)");
+  path.setAttribute("stroke-width", "2");
+  path.setAttribute("stroke-linejoin", "round");
+  path.setAttribute("stroke-linecap", "round");
+  g.appendChild(path);
+
+  // end marker
+  const last = points.length - 1;
+  const dot = document.createElementNS(ns, "circle");
+  dot.setAttribute("cx", x(last)); dot.setAttribute("cy", y(points[last].value));
+  dot.setAttribute("r", "5"); dot.setAttribute("fill", "var(--series-1)");
+  dot.setAttribute("stroke", "var(--surface-1)"); dot.setAttribute("stroke-width", "2");
+  g.appendChild(dot);
+
+  // hover targets
+  points.forEach((p, i) => {
+    const hit = document.createElementNS(ns, "circle");
+    hit.setAttribute("cx", x(i)); hit.setAttribute("cy", y(p.value));
+    hit.setAttribute("r", "10"); hit.setAttribute("fill", "transparent");
+    hit.addEventListener("mousemove", (evt) => {
+      tooltip.style.display = "block";
+      tooltip.style.left = `${evt.offsetX + 12}px`;
+      tooltip.style.top = `${evt.offsetY - 10}px`;
+      tooltip.innerHTML = `<strong>${p.value}</strong><br><span style="color:var(--text-muted)">${p.date}</span>`;
+    });
+    hit.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+    g.appendChild(hit);
+  });
+
+  svg.appendChild(g);
+}
+
+function renderGapNote(region, signal) {
+  const note = document.getElementById("trend-gap-note");
+  const gap = KNOWN_GAPS[gapKey(region, signal)];
+  note.innerHTML = gap ? `<div class="gap-note">${severityBadge("gap")}<span><strong>Known data gap.</strong> ${gap}</span></div>` : "";
+}
+
+async function loadTrend() {
+  const signal = document.getElementById("trend-signal").value;
+  const region = document.getElementById("trend-region").value;
+  document.getElementById("trend-sub").textContent = `Recent readings for ${region} · ${signal.replace(/_/g, " ")}`;
+  renderGapNote(region, signal);
+  const svg = document.getElementById("trend-chart");
+  if (!svg.children.length) {
+    svg.innerHTML = `<text x="230" y="110" text-anchor="middle" fill="var(--text-muted)" font-size="12">Loading…</text>`;
+  }
+  try {
+    const resp = await getJSON(`/signals/${encodeURIComponent(signal)}/${encodeURIComponent(region)}`);
+    drawTrend(resp.data || []);
+  } catch (e) {
+    drawTrend([]);
+  }
+}
+
+function initTrendControls() {
+  const sSel = document.getElementById("trend-signal");
+  const rSel = document.getElementById("trend-region");
+  sSel.innerHTML = SIGNAL_TYPES.map(s => `<option value="${s}">${s.replace(/_/g, " ")}</option>`).join("");
+  rSel.innerHTML = REGIONS.map(r => `<option value="${r}">${r}</option>`).join("");
+  const onChange = () => { loadTrend(); document.getElementById("match-result").innerHTML = ""; };
+  sSel.addEventListener("change", onChange);
+  rSel.addEventListener("change", onChange);
+}
+
+// ---- cross-region pattern match (stretch feature) ------------------------
+async function runClosestMatch() {
+  const signal = document.getElementById("trend-signal").value;
+  const region = document.getElementById("trend-region").value;
+  const el = document.getElementById("match-result");
+  el.innerHTML = `<div class="empty">Comparing against other regions…</div>`;
+  try {
+    const resp = await getJSON(`/regions/${encodeURIComponent(region)}/closest-match?${new URLSearchParams({ signal_type: signal })}`);
+    if (!resp.closest_match) {
+      el.innerHTML = `<div class="match-result">No comparable match found — ${region} may not have enough history for ${signal.replace(/_/g, " ")} yet.</div>`;
+      return;
+    }
+    const m = resp.closest_match;
+    el.innerHTML = `<div class="match-result"><strong>${region}</strong>'s current ${signal.replace(/_/g, " ")} trend most resembles <strong>${m.region}</strong> on ${m.date} (value ${m.value}, z-score ${m.z_score}).</div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not compute a match (${e.message})</div>`;
+  }
+}
+
+function initMatchControls() {
+  document.getElementById("match-button").addEventListener("click", runClosestMatch);
+}
+
+// ---- alerts ---------------------------------------------------------
+async function transitionAlert(id, toState, evt) {
+  evt.stopPropagation();
+  try {
+    await fetch(`/alerts/${id}/transition?to_state=${encodeURIComponent(toState)}&reason=${encodeURIComponent("dashboard action")}`, { method: "POST" });
+    loadAlerts();
+  } catch (e) { /* surfaced via re-render */ }
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderReasoning(trace) {
+  const steps = (trace && trace.steps) || [];
+  const byName = name => steps.find(s => s.step === name);
+  const fetchStep = byName("fetch_recent_signals");
+  const featStep = byName("compute_features");
+  const embedStep = byName("embed_situation");
+  const searchStep = byName("search_historical_context");
+  const decideStep = byName("reason_and_decide");
+
+  const rows = [];
+  if (fetchStep) rows.push(["Signal history", `${fetchStep.count} recent reading(s) fetched from CockroachDB`]);
+  if (featStep && featStep.features && !featStep.features.insufficient_data) {
+    const f = featStep.features;
+    rows.push(["Computed features", `z-score ${f.z_score ?? "—"} · week-over-week ${f.week_over_week_pct_change ?? "—"}% · baseline mean ${f.baseline_mean ?? "—"} (±${f.baseline_stdev ?? "—"})`]);
+  }
+  if (embedStep) rows.push(["Embedded situation", `&ldquo;${escapeHtml(embedStep.text)}&rdquo;`]);
+  if (searchStep) {
+    const matched = searchStep.matched_reports || [];
+    const val = matched.length
+      ? matched.map(m => `${escapeHtml(m.title)} <span style="color:var(--text-muted)">(${m.published_date}, distance ${m.distance.toFixed(2)})</span>`).join("<br>")
+      : "no similar reports found in memory";
+    rows.push(["Matched via vector search", val]);
+  }
+  if (decideStep && decideStep.decision) {
+    rows.push(["Decision", escapeHtml(decideStep.decision.message)]);
+  }
+  if (!rows.length) return `<div class="reasoning"><div class="step"><div class="v">No trace recorded.</div></div></div>`;
+  return `<div class="reasoning">${rows.map(([k, v]) => `<div class="step"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("")}</div>`;
+}
+
+const expandedAlerts = new Set(); // survives the 30s auto-refresh so an open trace doesn't snap shut mid-demo
+
+function alertActions(a) {
+  const buttons = [];
+  if (a.state === "new") buttons.push(`<button data-id="${a.id}" data-to="acknowledged">Ack</button>`);
+  if (a.state !== "resolved") buttons.push(`<button data-id="${a.id}" data-to="resolved">Resolve</button>`);
+  return buttons.join("");
+}
+
+async function loadAlerts() {
+  const el = document.getElementById("alerts");
+  if (!el.innerHTML) el.innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const rows = await getJSON("/alerts?limit=15");
+    if (!rows.length) { el.innerHTML = `<div class="empty">No alerts yet — run an agent cycle first.</div>`; return; }
+    el.innerHTML = `
+      <table>
+        <thead><tr><th></th><th>Severity</th><th>Region / signal</th><th>Message</th><th>State</th><th>When</th><th></th></tr></thead>
+        <tbody>
+          ${rows.map(a => {
+            const isOpen = expandedAlerts.has(a.id);
+            return `
+            <tr class="alert-row" data-expand="${a.id}">
+              <td><span class="chevron${isOpen ? " open" : ""}">▸</span></td>
+              <td>${severityBadge(a.severity)}</td>
+              <td>${a.region} · ${a.signal_type.replace(/_/g, " ")}</td>
+              <td style="max-width:220px">${escapeHtml(a.message)}</td>
+              <td><span class="state-pill">${a.state}</span></td>
+              <td>${new Date(a.created_at).toLocaleString()}</td>
+              <td class="row-actions">${alertActions(a)}</td>
+            </tr>
+            <tr class="alert-detail" data-detail="${a.id}" style="display:${isOpen ? "table-row" : "none"}">
+              <td colspan="7">${renderReasoning(a.agent_reasoning)}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>`;
+    el.querySelectorAll("button[data-id]").forEach(btn => {
+      btn.addEventListener("click", (evt) => transitionAlert(btn.dataset.id, btn.dataset.to, evt));
+    });
+    el.querySelectorAll("tr.alert-row").forEach(row => {
+      row.addEventListener("click", () => {
+        const id = row.dataset.expand;
+        const detail = el.querySelector(`tr[data-detail="${id}"]`);
+        const chevron = row.querySelector(".chevron");
+        const open = detail.style.display !== "none";
+        detail.style.display = open ? "none" : "table-row";
+        chevron.classList.toggle("open", !open);
+        if (open) expandedAlerts.delete(id); else expandedAlerts.add(id);
+      });
+    });
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not load alerts (${e.message})</div>`;
+  }
+}
+
+// ---- audit ---------------------------------------------------------
+async function loadAudit() {
+  const el = document.getElementById("audit");
+  if (!el.innerHTML) el.innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const rows = await getJSON("/audit?limit=15");
+    if (!rows.length) { el.innerHTML = `<div class="empty">No audit entries yet.</div>`; return; }
+    el.innerHTML = `
+      <table>
+        <thead><tr><th>Actor</th><th>Action</th><th>Resource</th><th>When</th></tr></thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td>${r.actor}</td>
+              <td>${r.action}</td>
+              <td style="max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${r.resource}</td>
+              <td>${new Date(r.created_at).toLocaleString()}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not load audit log (${e.message})</div>`;
+  }
+}
+
+// ---- semantic search --------------------------------------------------
+async function runSearch() {
+  const input = document.getElementById("search-input");
+  const el = document.getElementById("search-results");
+  const q = input.value.trim();
+  if (!q) { el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="empty">Searching memory…</div>`;
+  try {
+    const resp = await getJSON(`/reports/search?${new URLSearchParams({ q, limit: 5 })}`);
+    if (!resp.results.length) { el.innerHTML = `<div class="empty">No matching reports found.</div>`; return; }
+    el.innerHTML = resp.results.map(r => `
+      <div class="search-result">
+        <div class="head">
+          <span class="title">${escapeHtml(r.title)}</span>
+          <span class="score">${r.published_date || "—"} · similarity ${r.similarity_pct}%</span>
+        </div>
+        <div class="snippet">${escapeHtml(r.content.slice(0, 260))}${r.content.length > 260 ? "…" : ""}</div>
+      </div>`).join("");
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Search failed (${e.message})</div>`;
+  }
+}
+
+function initSearchControls() {
+  document.getElementById("search-button").addEventListener("click", runSearch);
+  document.getElementById("search-input").addEventListener("keydown", (evt) => {
+    if (evt.key === "Enter") runSearch();
+  });
+}
+
+async function refreshAll() {
+  await Promise.all([loadStatTiles(), loadRankings(), loadTrend(), loadAlerts(), loadAudit()]);
+}
+
+initTrendControls();
+initSearchControls();
+initMatchControls();
+refreshAll();
+setInterval(refreshAll, 30000);
+</script>
+</body>
+</html>
