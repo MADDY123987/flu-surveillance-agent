@@ -98,3 +98,7 @@ CDC publishes several public APIs/datasets (e.g. FluView, COVID Data Tracker) vi
 data.cdc.gov (Socrata). `app/ingest.py` has a placeholder `fetch_cdc_data()` - swap in the
 specific dataset endpoint you choose once you've picked your exact signal (see README TODO
 in that file). Keep it to ONE signal and 2-3 regions for the hackathon scope.
+
+# flu-surveillance-agent
+An agent that ingests CDC flu surveillance data, remembers historical patterns in CockroachDB, and generates auditable alerts using Bedrock reasoning
+ 3c0be781d5651c2a7fc01e51bbc839d008d47250
