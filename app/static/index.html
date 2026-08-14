@@ -282,8 +282,8 @@ async function loadStatTiles() {
     el.innerHTML = `
       <div class="stat-tile"><div class="label">Regions monitored</div><div class="value">${REGIONS.length}</div></div>
       <div class="stat-tile"><div class="label">Signals tracked</div><div class="value">${SIGNAL_TYPES.length}</div></div>
-      <div class="stat-tile"><div class="label">Active alerts</div><div class="value" style="color:var(--critical)">${active}</div></div>
-      <div class="stat-tile"><div class="label">Watch-level alerts</div><div class="value" style="color:var(--warning)">${watch}</div></div>
+      <div class="stat-tile" title="Alert-severity rows in the alerts table, including any generated from historical/demo runs - not necessarily current activity"><div class="label">Alert-severity count</div><div class="value" style="color:var(--critical)">${active}</div></div>
+      <div class="stat-tile" title="Watch-severity rows in the alerts table, including any generated from historical/demo runs - not necessarily current activity"><div class="label">Watch-severity count</div><div class="value" style="color:var(--warning)">${watch}</div></div>
     `;
   } catch (e) {
     el.innerHTML = `<div class="empty">Could not load stats (${e.message})</div>`;
