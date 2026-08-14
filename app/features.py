@@ -6,6 +6,9 @@ to reason over, not just data to crunch.
 """
 
 import statistics
+from datetime import date
+
+from app.config import FRESHNESS_THRESHOLD_DAYS
 
 # Below this, a baseline's stdev reflects reporting noise around a flat signal, not real
 # variance - dividing by it inflates ordinary wobbles into z-scores that look alarming.
@@ -14,6 +17,25 @@ import statistics
 # stdevs run ~0.39-1.76. 0.15 sits above typical quiet-season noise without suppressing
 # real peak-season movement.
 STDEV_FLOOR = 0.15
+
+# Below this many historical points, a baseline's mean/stdev is too noisy to trust - a
+# single-point baseline (stdev=0.0000) previously produced z-scores like -6.08 that were
+# really just measuring distance from one arbitrary prior reading, not a real deviation
+# from an established pattern. Below the guard, features are reported as insufficient_data
+# (the same shape already used for len(recent) < 2) rather than emitting a misleading score.
+MIN_BASELINE_OBSERVATIONS = 8
+
+
+def is_stale(latest_date: str, as_of_date: str | None = None) -> bool:
+    """
+    True if latest_date is older than FRESHNESS_THRESHOLD_DAYS relative to as_of_date
+    (defaults to today, for live runs). For historical/demo runs that reason "as of" a
+    past date, pass that same as_of_date here too - staleness is always relative to the
+    point in time being reasoned about, not the wall-clock date the code happens to run on.
+    """
+    reference = date.fromisoformat(as_of_date) if as_of_date else date.today()
+    days_old = (reference - date.fromisoformat(latest_date)).days
+    return days_old > FRESHNESS_THRESHOLD_DAYS
 
 
 def compute_features(recent: list[dict]) -> dict:
@@ -28,11 +50,14 @@ def compute_features(recent: list[dict]) -> dict:
     latest = values[-1]
     previous = values[-2]
 
+    baseline = values[:-1]  # everything except the latest point, as the historical baseline
+    if len(baseline) < MIN_BASELINE_OBSERVATIONS:
+        return {"insufficient_data": True}
+
     week_over_week_pct_change = (
         ((latest - previous) / previous) * 100 if previous != 0 else None
     )
 
-    baseline = values[:-1]  # everything except the latest point, as the historical baseline
     baseline_mean = statistics.mean(baseline)
     baseline_stdev = statistics.stdev(baseline) if len(baseline) > 1 else 0
 

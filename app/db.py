@@ -46,20 +46,22 @@ def upsert_signal(source: str, signal_type: str, region: str, observed_date: str
     log_audit("ingest_job", "write", f"health_signals:{region}:{signal_type}", {"value": value})
 
 
-def get_recent_signals(signal_type: str, region: str, limit: int = 12) -> list[dict]:
+def get_recent_signals(signal_type: str, region: str, limit: int = 12, as_of_date: str | None = None) -> list[dict]:
+    """
+    as_of_date (optional, 'YYYY-MM-DD'): restrict to observations on or before this date,
+    for reasoning against a historical point in time (e.g. a demo run over past peak
+    weeks) rather than always the newest data. Omit for the regular "current" read.
+    """
+    query = "SELECT observed_date, value FROM health_signals WHERE signal_type = :signal_type AND region = :region"
+    params = {"signal_type": signal_type, "region": region, "limit": limit}
+    if as_of_date is not None:
+        query += " AND observed_date <= :as_of_date"
+        params["as_of_date"] = as_of_date
+    query += " ORDER BY observed_date DESC LIMIT :limit"
+
     with engine.begin() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT observed_date, value FROM health_signals
-                WHERE signal_type = :signal_type AND region = :region
-                ORDER BY observed_date DESC
-                LIMIT :limit
-                """
-            ),
-            {"signal_type": signal_type, "region": region, "limit": limit},
-        ).fetchall()
-    log_audit("agent", "read", f"health_signals:{region}:{signal_type}", {"rows": len(rows)})
+        rows = conn.execute(text(query), params).fetchall()
+    log_audit("agent", "read", f"health_signals:{region}:{signal_type}", {"rows": len(rows), "as_of_date": as_of_date})
     return [{"date": str(r[0]), "value": r[1]} for r in rows][::-1]  # oldest -> newest
 
 
@@ -107,14 +109,19 @@ def search_similar_reports(embedding: list[float], limit: int = 3, actor: str = 
     return [{"title": r[0], "content": r[1], "published_date": str(r[2]), "distance": r[3]} for r in rows]
 
 
-def insert_alert(signal_type: str, region: str, severity: str, message: str, reasoning: dict) -> str:
-    """Create a new alert in the 'new' state and record that as its first transition."""
+def insert_alert(signal_type: str, region: str, severity: str, message: str, reasoning: dict, observed_date: str) -> str:
+    """
+    Create a new alert in the 'new' state and record that as its first transition.
+    observed_date is the date of the actual data point that triggered this alert -
+    distinct from created_at (when the alert row was written), which can differ
+    significantly for alerts generated from historical/demo agent runs.
+    """
     with engine.begin() as conn:
         row = conn.execute(
             text(
                 """
-                INSERT INTO alerts (signal_type, region, severity, message, agent_reasoning, state)
-                VALUES (:signal_type, :region, :severity, :message, CAST(:reasoning AS JSONB), 'new')
+                INSERT INTO alerts (signal_type, region, severity, message, agent_reasoning, observed_date, state)
+                VALUES (:signal_type, :region, :severity, :message, CAST(:reasoning AS JSONB), :observed_date, 'new')
                 RETURNING id
                 """
             ),
@@ -124,6 +131,7 @@ def insert_alert(signal_type: str, region: str, severity: str, message: str, rea
                 "severity": severity,
                 "message": message,
                 "reasoning": json.dumps(reasoning),
+                "observed_date": observed_date,
             },
         ).fetchone()
         alert_id = str(row[0])

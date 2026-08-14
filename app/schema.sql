@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     message STRING NOT NULL,
     state STRING NOT NULL DEFAULT 'new',  -- 'new' | 'acknowledged' | 'resolved'
     agent_reasoning JSONB,            -- step-by-step trace, useful for the demo video
+    observed_date DATE,               -- date of the underlying data point, distinct from
+                                       -- created_at (when this row was written) - can differ
+                                       -- significantly for historical/demo agent runs
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

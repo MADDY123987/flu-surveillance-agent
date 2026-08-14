@@ -4,9 +4,9 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from app.db import engine, get_recent_signals, search_similar_reports, transition_alert_state
-from app.features import compute_features
+from app.features import compute_features, is_stale
 from app.config import TARGET_REGIONS
-from app.agent import embed_text, run_agent_cycle
+from app.agent import determine_direction, embed_text, run_agent_cycle
 from app.ingest import run_ingest
 from app.patterns import find_closest_match
 
@@ -36,8 +36,14 @@ def signals(signal_type: str, region: str):
 def rankings():
     """
     Rank every region/signal combination by how anomalous it currently is (|z-score|),
-    most concerning first. This is the 'top outbreak signals' view for the dashboard -
-    turns raw memory into a genuinely useful prioritized view.
+    most concerning first among the rising ones. This is the 'top outbreak signals' view
+    for the dashboard - turns raw memory into a genuinely useful prioritized view.
+
+    Stale combinations (newest observation older than FRESHNESS_THRESHOLD_DAYS) are
+    excluded entirely - a big z-score computed from months-old data isn't a current
+    signal (see HANDOFF.md validation notes on the NY flu freshness fix). Ranking order
+    is rising-first, then by |z-score| within each group - the z-score values themselves
+    are unchanged, only where each row sorts.
     """
     signal_types = ["flu_like_illness", "covid19_hospitalization", "rsv_hospitalization"]
     ranked = []
@@ -50,16 +56,20 @@ def rankings():
             z = features.get("z_score")
             if z is None:
                 continue
+            if is_stale(recent[-1]["date"]):
+                continue
+            direction = determine_direction(z)
             ranked.append(
                 {
                     "region": region,
                     "signal_type": signal_type,
                     "z_score": z,
+                    "direction": direction,
                     "latest_value": features["latest_value"],
                     "week_over_week_pct_change": features["week_over_week_pct_change"],
                 }
             )
-    ranked.sort(key=lambda r: abs(r["z_score"]), reverse=True)
+    ranked.sort(key=lambda r: (0 if r["direction"] == "rising" else 1, -abs(r["z_score"])))
     return ranked
 
 
@@ -89,7 +99,7 @@ def alerts(limit: int = 20):
         rows = conn.execute(
             text(
                 """
-                SELECT id, signal_type, region, severity, message, state, agent_reasoning, created_at
+                SELECT id, signal_type, region, severity, message, state, agent_reasoning, observed_date, created_at
                 FROM alerts ORDER BY created_at DESC LIMIT :limit
                 """
             ),
@@ -104,7 +114,8 @@ def alerts(limit: int = 20):
             "message": r[4],
             "state": r[5],
             "agent_reasoning": r[6],
-            "created_at": str(r[7]),
+            "observed_date": str(r[7]) if r[7] else None,
+            "created_at": str(r[8]),
         }
         for r in rows
     ]

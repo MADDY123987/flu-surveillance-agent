@@ -132,6 +132,17 @@
 
   .badge.gap { color: var(--warning); background: color-mix(in srgb, var(--warning) 18%, transparent); }
   .badge.gap .dot { background: var(--warning); }
+
+  .badge.rising { color: var(--serious); background: color-mix(in srgb, var(--serious) 14%, transparent); }
+  .badge.rising .dot { background: var(--serious); }
+  .badge.falling { color: var(--good); background: color-mix(in srgb, var(--good) 14%, transparent); }
+  .badge.falling .dot { background: var(--good); }
+  .badge.neutral { color: var(--text-muted); background: color-mix(in srgb, var(--text-muted) 14%, transparent); }
+  .badge.neutral .dot { background: var(--text-muted); }
+
+  td.message-cell { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .observed-date { white-space: nowrap; }
+  .observed-date .stale-flag { color: var(--warning); font-size: 10px; margin-left: 4px; }
   .gap-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 12px; padding: 8px 10px; background: color-mix(in srgb, var(--warning) 10%, transparent); border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent); border-radius: 8px; font-size: 11px; color: var(--text-secondary); }
   .gap-note strong { color: var(--text-primary); }
 
@@ -245,6 +256,18 @@ function severityBadge(sev) {
   if (sev === "gap") return `<span class="badge gap"><span class="dot"></span>data gap</span>`;
   const cls = sev === "alert" ? "alert" : sev === "watch" ? "watch" : "info";
   return `<span class="badge ${cls}"><span class="dot"></span>${sev}</span>`;
+}
+
+function directionBadge(dir) {
+  if (!dir) return "";
+  const arrow = dir === "rising" ? "↑" : dir === "falling" ? "↓" : "→";
+  const cls = dir === "rising" ? "rising" : dir === "falling" ? "falling" : "neutral";
+  return `<span class="badge ${cls}"><span class="dot"></span>${arrow} ${dir}</span>`;
+}
+
+function truncate(s, n) {
+  const str = String(s ?? "");
+  return str.length > n ? str.slice(0, n) + "…" : str;
 }
 
 // ---- stat tiles -----------------------------------------------------------
@@ -438,16 +461,19 @@ function renderReasoning(trace) {
   const byName = name => steps.find(s => s.step === name);
   const fetchStep = byName("fetch_recent_signals");
   const featStep = byName("compute_features");
+  const freshStep = byName("freshness_check");
   const embedStep = byName("embed_situation");
   const searchStep = byName("search_historical_context");
   const decideStep = byName("reason_and_decide");
 
   const rows = [];
+  if (trace && trace.as_of_date) rows.push(["Reasoned as of", `${trace.as_of_date} <span style="color:var(--text-muted)">(historical run, not current data)</span>`]);
   if (fetchStep) rows.push(["Signal history", `${fetchStep.count} recent reading(s) fetched from CockroachDB`]);
   if (featStep && featStep.features && !featStep.features.insufficient_data) {
     const f = featStep.features;
     rows.push(["Computed features", `z-score ${f.z_score ?? "—"} · week-over-week ${f.week_over_week_pct_change ?? "—"}% · baseline mean ${f.baseline_mean ?? "—"} (±${f.baseline_stdev ?? "—"})`]);
   }
+  if (freshStep) rows.push(["Freshness check", freshStep.stale ? `stale as of ${freshStep.latest_date} — not treated as current` : `current (${freshStep.latest_date})`]);
   if (embedStep) rows.push(["Embedded situation", `&ldquo;${escapeHtml(embedStep.text)}&rdquo;`]);
   if (searchStep) {
     const matched = searchStep.matched_reports || [];
@@ -457,7 +483,9 @@ function renderReasoning(trace) {
     rows.push(["Matched via vector search", val]);
   }
   if (decideStep && decideStep.decision) {
-    rows.push(["Decision", escapeHtml(decideStep.decision.message)]);
+    const d = decideStep.decision;
+    rows.push(["Rule fired", escapeHtml(d.rule_fired || "—")]);
+    rows.push(["Decision", `${directionBadge(d.direction)} ${escapeHtml(d.message)}`]);
   }
   if (!rows.length) return `<div class="reasoning"><div class="step"><div class="v">No trace recorded.</div></div></div>`;
   return `<div class="reasoning">${rows.map(([k, v]) => `<div class="step"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("")}</div>`;
@@ -472,6 +500,13 @@ function alertActions(a) {
   return buttons.join("");
 }
 
+// direction isn't its own column - it lives in the reasoning trace's decision step
+function alertDirection(a) {
+  const steps = (a.agent_reasoning && a.agent_reasoning.steps) || [];
+  const decideStep = steps.find(s => s.step === "reason_and_decide");
+  return decideStep && decideStep.decision ? decideStep.decision.direction : null;
+}
+
 async function loadAlerts() {
   const el = document.getElementById("alerts");
   if (!el.innerHTML) el.innerHTML = `<div class="empty">Loading…</div>`;
@@ -480,22 +515,25 @@ async function loadAlerts() {
     if (!rows.length) { el.innerHTML = `<div class="empty">No alerts yet — run an agent cycle first.</div>`; return; }
     el.innerHTML = `
       <table>
-        <thead><tr><th></th><th>Severity</th><th>Region / signal</th><th>Message</th><th>State</th><th>When</th><th></th></tr></thead>
+        <thead><tr><th></th><th>Severity</th><th>Dir.</th><th>Region / signal</th><th>Message</th><th>State</th><th>Observed</th><th>Alert created</th><th></th></tr></thead>
         <tbody>
           ${rows.map(a => {
             const isOpen = expandedAlerts.has(a.id);
+            const direction = alertDirection(a);
             return `
             <tr class="alert-row" data-expand="${a.id}">
               <td><span class="chevron${isOpen ? " open" : ""}">▸</span></td>
               <td>${severityBadge(a.severity)}</td>
+              <td>${directionBadge(direction)}</td>
               <td>${a.region} · ${a.signal_type.replace(/_/g, " ")}</td>
-              <td style="max-width:220px">${escapeHtml(a.message)}</td>
+              <td class="message-cell" title="${escapeHtml(a.message)}">${escapeHtml(truncate(a.message, 90))}</td>
               <td><span class="state-pill">${a.state}</span></td>
+              <td class="observed-date">${a.observed_date || "—"}</td>
               <td>${new Date(a.created_at).toLocaleString()}</td>
               <td class="row-actions">${alertActions(a)}</td>
             </tr>
             <tr class="alert-detail" data-detail="${a.id}" style="display:${isOpen ? "table-row" : "none"}">
-              <td colspan="7">${renderReasoning(a.agent_reasoning)}</td>
+              <td colspan="9">${renderReasoning(a.agent_reasoning)}</td>
             </tr>`;
           }).join("")}
         </tbody>

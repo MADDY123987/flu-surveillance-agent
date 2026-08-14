@@ -12,7 +12,7 @@ from groq import Groq
 from app.config import GROQ_API_KEY, GROQ_MODEL, TARGET_REGIONS, TARGET_SIGNAL
 from app.db import get_recent_signals, search_similar_reports, insert_alert
 from app.embeddings import embed_text
-from app.features import compute_features
+from app.features import compute_features, is_stale, MIN_BASELINE_OBSERVATIONS
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -22,20 +22,40 @@ client = Groq(api_key=GROQ_API_KEY)
 # HANDOFF.md validation notes: leaving severity to the model's free-text judgment
 # produced internally inconsistent output, e.g. meaningful_change=true paired with
 # severity="info" on a real threshold-crossing z-score).
+#
+# Severity is also directional: a large |z| only becomes watch/alert when the signal
+# is rising. A large negative z (activity falling away from an elevated baseline) is
+# not an outbreak signal just because the magnitude is big - it gets reported as
+# declining activity instead (see HANDOFF.md validation notes on the Texas/US flu
+# decline that was previously misread as alert-worthy).
 ALERT_Z_THRESHOLD = 2
 WATCH_Z_THRESHOLD = 1
 
 
-def determine_severity(z_score: float | None) -> tuple[str, str]:
+def determine_direction(z_score: float | None) -> str:
+    if z_score is None:
+        return "neutral"
+    if z_score > 0:
+        return "rising"
+    if z_score < 0:
+        return "falling"
+    return "neutral"
+
+
+def determine_severity(z_score: float | None, direction: str) -> tuple[str, str]:
     """Returns (severity, rule_fired) - rule_fired is a human-readable audit trail of why."""
     if z_score is None:
-        return "info", "no z-score available (insufficient baseline variance)"
+        return "info", "no z-score available (insufficient baseline history)"
     az = abs(z_score)
+    if direction != "rising":
+        if az >= WATCH_Z_THRESHOLD:
+            return "info", f"|z_score|={az:.2f} but direction={direction} -> declining/neutral activity, not an outbreak alert"
+        return "info", f"|z_score|={az:.2f} < {WATCH_Z_THRESHOLD} -> info"
     if az >= ALERT_Z_THRESHOLD:
-        return "alert", f"|z_score|={az:.2f} >= {ALERT_Z_THRESHOLD} -> alert"
+        return "alert", f"direction=rising, |z_score|={az:.2f} >= {ALERT_Z_THRESHOLD} -> alert"
     if az >= WATCH_Z_THRESHOLD:
-        return "watch", f"|z_score|={az:.2f} >= {WATCH_Z_THRESHOLD} -> watch"
-    return "info", f"|z_score|={az:.2f} < {WATCH_Z_THRESHOLD} -> info"
+        return "watch", f"direction=rising, |z_score|={az:.2f} >= {WATCH_Z_THRESHOLD} -> watch"
+    return "info", f"direction=rising, |z_score|={az:.2f} < {WATCH_Z_THRESHOLD} -> info"
 
 
 REPORT_SNIPPET_CHARS = 400  # keep the prompt within Groq's TPM limits - full text already
@@ -44,9 +64,10 @@ REPORT_SNIPPET_CHARS = 400  # keep the prompt within Groq's TPM limits - full te
 
 
 def reason_and_decide(region: str, signal_type: str, recent: list[dict], features: dict, similar_reports: list[dict]) -> dict:
-    """Step: severity is already decided (see determine_severity) - ask the reasoning
-    model only to explain/contextualize it against history, not to choose it."""
-    severity, rule_fired = determine_severity(features.get("z_score"))
+    """Step: severity/direction are already decided (see determine_severity) - ask the
+    reasoning model only to explain/contextualize it against history, not to choose it."""
+    direction = determine_direction(features.get("z_score"))
+    severity, rule_fired = determine_severity(features.get("z_score"), direction)
     meaningful_change = severity != "info"
 
     report_snippets = [
@@ -55,11 +76,13 @@ def reason_and_decide(region: str, signal_type: str, recent: list[dict], feature
     ]
 
     prompt = f"""You are a public health surveillance analyst. A surveillance system has
-already computed the statistics below and, from a deterministic rule on the z-score, has
-already classified this reading as severity "{severity}" ({rule_fired}). Your job is NOT to
-choose or restate a severity - it's to write a one or two sentence plain-English explanation
-of why this reading does or doesn't look concerning, referencing the computed statistics and
-any similar historical reports below.
+already computed the statistics below and, from a deterministic rule on the z-score and
+its direction, has already classified this reading as severity "{severity}" ({rule_fired}).
+The signal's current direction relative to its own recent baseline is "{direction}". Your
+job is NOT to choose or restate a severity - it's to write a one or two sentence plain-English
+explanation of why this reading does or doesn't look concerning given its direction,
+referencing the computed statistics and any similar historical reports below. If direction is
+"falling", describe it as declining activity rather than framing it as an outbreak concern.
 
 Computed statistics for {signal_type} in {region}:
 {json.dumps(features, indent=2)}
@@ -89,16 +112,23 @@ Respond ONLY with JSON in this exact shape, no other text:
     return {
         "meaningful_change": meaningful_change,
         "severity": severity,
+        "direction": direction,
         "rule_fired": rule_fired,
         "message": groq_context,
     }
 
 
-def run_agent_cycle(region: str, signal_type: str):
-    trace = {"region": region, "signal_type": signal_type, "steps": []}
+def run_agent_cycle(region: str, signal_type: str, as_of_date: str | None = None):
+    """
+    as_of_date (optional, 'YYYY-MM-DD'): reason against data as it stood on this date
+    instead of the newest available - for historical/demo runs over real past periods
+    (e.g. a documented peak week). Freshness is judged relative to as_of_date in that
+    case, not the wall-clock date this happens to run on. Omit for the regular live cycle.
+    """
+    trace = {"region": region, "signal_type": signal_type, "as_of_date": as_of_date, "steps": []}
 
     # Step 1: fetch recent signal history from CockroachDB
-    recent = get_recent_signals(signal_type, region)
+    recent = get_recent_signals(signal_type, region, as_of_date=as_of_date)
     trace["steps"].append({"step": "fetch_recent_signals", "count": len(recent)})
     if len(recent) < 2:
         print(f"[agent] Not enough history yet for {region}/{signal_type}, skipping")
@@ -107,10 +137,22 @@ def run_agent_cycle(region: str, signal_type: str):
     # Step 2: compute derived statistics (z-score, week-over-week % change)
     features = compute_features(recent)
     trace["steps"].append({"step": "compute_features", "features": features})
+    if features.get("insufficient_data"):
+        print(f"[agent] Fewer than {MIN_BASELINE_OBSERVATIONS} baseline observations for {region}/{signal_type}, skipping")
+        return trace
 
-    # Step 3: describe the current situation and embed it
+    # Step 2b: freshness guard - a stale "latest" isn't treated as current and doesn't
+    # drive an alert, no matter what its z-score says (see HANDOFF.md validation notes
+    # on the NY flu z=2.72 alert generated from an 11-month-stale data point).
     latest = recent[-1]
-    situation_text = f"{signal_type} in {region} is currently {latest['value']} as of {latest['date']}"
+    if is_stale(latest["date"], as_of_date=as_of_date):
+        trace["steps"].append({"step": "freshness_check", "stale": True, "latest_date": latest["date"]})
+        print(f"[agent] Latest observation for {region}/{signal_type} ({latest['date']}) is stale, skipping")
+        return trace
+    trace["steps"].append({"step": "freshness_check", "stale": False, "latest_date": latest["date"]})
+
+    # Step 3: describe the situation and embed it
+    situation_text = f"{signal_type} in {region} was {latest['value']} as of {latest['date']}"
     embedding = embed_text(situation_text)
     trace["steps"].append({"step": "embed_situation", "text": situation_text})
 
@@ -137,15 +179,16 @@ def run_agent_cycle(region: str, signal_type: str):
             severity=decision.get("severity", "info"),
             message=decision.get("message", ""),
             reasoning=trace,
+            observed_date=latest["date"],
         )
         trace["steps"].append({"step": "alert_stored"})
 
     return trace
 
 
-def run_all():
+def run_all(as_of_date: str | None = None):
     for region in TARGET_REGIONS:
-        trace = run_agent_cycle(region, TARGET_SIGNAL)
+        trace = run_agent_cycle(region, TARGET_SIGNAL, as_of_date=as_of_date)
         print(json.dumps(trace, indent=2))
 
 
