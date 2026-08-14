@@ -1,104 +1,249 @@
-# Public Health Surveillance Agent
+# Flu Surveillance Agent
 
-An agent that ingests real public health surveillance data (CDC public feeds) every 4 hours,
-stores it as durable memory in CockroachDB, and reasons over that memory with a self-built
-agent loop (Bedrock LLM calls, not managed Bedrock Agents) to detect meaningful trend shifts
-and generate plain-English alerts.
+An agent that continuously ingests real CDC respiratory surveillance data, remembers it
+durably and semantically in CockroachDB, and reasons over that memory to rank and explain
+emerging outbreak risk across US regions.
+
+Built for the **CockroachDB × AWS Hackathon — Build with Agentic Memory**.
+
+**Live demo:** _TODO: add App Runner URL_
+**Demo video:** _TODO: add YouTube link_
+
+---
 
 ## Why this exists
 
-Public health signals (flu-like illness rates, wastewater viral levels, etc.) are published
-constantly but scattered. Nobody has a system that continuously watches them, remembers
-history, and flags when something actually matters vs. normal noise. That's what this agent
-does.
+Respiratory surveillance signals — influenza-like illness rates, COVID and RSV
+hospitalization rates, CDC's weekly narrative analysis — are published continuously but
+sit in separate systems with no shared memory. Nobody is continuously watching them,
+remembering what previous seasons looked like, and distinguishing a meaningful shift from
+ordinary week-to-week noise.
+
+This agent does that. The memory layer is the point: without durable history there is no
+baseline, and without a baseline there is no way to say whether this week matters.
+
+---
+
+## What it actually does
+
+Every 4 hours it ingests three real CDC sources, stores them in CockroachDB, and runs a
+five-step reasoning loop that produces auditable, explained alerts.
+
+**Regions:** US National, California, Texas, New York
+**Signals:** influenza-like illness (ILINet), COVID-19 and RSV hospitalization rates
+(RESP-NET), plus CDC FluView weekly narrative reports
+
+---
 
 ## Architecture
 
 ```
-CDC public data feed
+3 CDC sources
+  ├── ILINet (CMU Delphi Epidata API)      -> influenza-like illness rate
+  ├── RESP-NET (data.cdc.gov Socrata)      -> COVID-19 + RSV hospitalization rates
+  └── FluView weekly narrative reports     -> real written CDC analysis (scraped HTML)
         |
-   (every 4h, EventBridge -> Lambda)
+   EventBridge Scheduler (every 4h)
+        |
         v
-  ingest.py  --clean/validate-->  CockroachDB
-                                     |-- health_signals   (time series)
-                                     |-- health_reports   (text + vector embeddings)
-                                     |-- alerts           (agent decisions)
-                                     |-- audit_log        (every agent read/write)
+   ingest.py  --fetch / clean / validate-->  CockroachDB
+        |                                      ├── health_signals            (time series)
+        |                                      ├── health_reports + VECTOR    (narrative text + embeddings)
+        └── raw HTML archived to S3            ├── alerts                     (agent decisions)
+                                               ├── alert_state_transitions    (full lifecycle)
+                                               └── audit_log                  (every agent read/write)
         ^
         |
-   agent.py (your own loop, not managed Bedrock Agents):
-     1. fetch_recent_signals()      -> query CockroachDB
-     2. search_historical_context() -> vector search over health_reports
-     3. compare_and_reason()        -> Bedrock LLM call w/ both as context
-     4. decide_and_act()            -> write alert + audit_log row if warranted
+   agent.py — single agent, 5-step loop:
+     1. fetch_recent_signals()      <- CockroachDB
+     2. compute_features()          -> z-score + week-over-week % change (real Python math,
+                                       not delegated to the LLM)
+     3. search_similar_reports()    <- CockroachDB vector search over FluView narratives
+     4. reason_and_decide()         -> Groq (llama-3.3-70b-versatile)
+     5. insert_alert() / transition_alert_state()  -> CockroachDB
         ^
         |
-   main.py (FastAPI) - exposes it all as an API + lets you trigger the loop manually
+   main.py (FastAPI) — REST API + dashboard, plus manual trigger endpoints
 ```
 
-## CockroachDB tools used (need 2+)
+Embeddings are generated **locally** with `BAAI/bge-small-en-v1.5` (384 dimensions) — no
+embedding API calls, no per-token cost, and the model is baked into the container image.
 
-1. **Distributed Vector Indexing** - `health_reports.embedding` column, searched for
-   semantic similarity to find past reports/advisories like the current situation. This
-   is what satisfies "Agentic Memory Design."
-2. **ccloud CLI (Agent-Ready)** - used for cluster lifecycle and operational visibility:
-   creating/checking the cluster, pulling audit logs, and checking backup status. This is
-   what satisfies "Production Readiness" - it's a separate judging criterion from memory
-   design, so covering both with distinct tools is deliberate.
+---
 
-   Example commands to run and capture for your demo video (check `ccloud --help` for the
-   exact current syntax, since CLI commands can change):
-   ```
-   ccloud cluster list
-   ccloud cluster describe <cluster-id>
-   ccloud auditlog list --cluster <cluster-id>
-   ccloud backup list --cluster <cluster-id>
-   ```
+## CockroachDB tools used (2 required)
 
-   Note: the app's own `audit_log` table (see `app/db.py`) is a separate, complementary
-   thing - it logs every read/write *the agent itself* performs, at the application level.
-   The ccloud CLI audit log is CockroachDB's own cluster-level audit trail. Showing both in
-   your demo is a stronger "Production Readiness" story than either alone.
+### 1. Distributed Vector Indexing
 
-We deliberately do NOT use the Cloud Managed MCP Server here - it's designed for
-connecting dev tools (Claude Code, Cursor, VS Code) to a cluster, not as a runtime API for
-a deployed agent's own reasoning loop. Using it that way would be a stretch of its intended
-purpose and adds integration risk without a clear scoring benefit over ccloud CLI.
+`health_reports.embedding` is a `VECTOR(384)` column with a vector index, holding embedded
+CDC FluView narrative reports. It powers two features:
 
-## AWS services used (need 1+)
+- **Semantic search** (`GET /reports/search?q=...`) — free-text search over historical CDC
+  narrative analysis. Querying "flu increasing rapidly" surfaces genuinely elevated-activity
+  reports rather than keyword matches.
+- **Historical context in reasoning** — step 3 of the agent loop retrieves semantically
+  similar past reports and passes them to the LLM as context, so decisions are grounded in
+  what previous comparable periods actually looked like.
 
-- **AWS Lambda** - runs `lambda_handler.py` on an EventBridge 4-hour schedule, doing the
-  ingest step.
-- **Amazon Bedrock** - `agent.py` calls Bedrock directly (Titan embeddings for the vector
-  index, a Claude model on Bedrock for the reasoning/decision steps). This is a hand-built
-  agent loop, not the managed Bedrock Agents product - that's intentional, for both learning
-  value and full visibility into each step for the demo video.
+This is what makes the memory *semantic* rather than just a time-series table.
+
+### 2. ccloud CLI
+
+Used for cluster lifecycle and operational visibility — cluster status, CockroachDB's own
+cluster-level audit trail, and backup verification:
+
+```bash
+ccloud cluster list
+ccloud cluster describe <cluster-id>
+ccloud auditlog list --cluster <cluster-id>
+ccloud backup list --cluster <cluster-id>
+```
+
+Note the application's own `audit_log` table is a separate, complementary layer: it records
+every read and write **the agent itself** performs, at the application level. The ccloud
+audit log is the cluster's own trail. Both exist deliberately.
+
+**On the Cloud Managed MCP Server:** deliberately not used. It is designed for connecting
+developer tools (Claude Code, Cursor, VS Code) to a cluster, not as a runtime API for a
+deployed agent's reasoning loop. Using it that way would stretch its intended purpose and
+add integration risk without a scoring benefit over ccloud CLI.
+
+---
+
+## AWS services used (1+ required)
+
+- **Amazon S3** — archives the raw FluView HTML for every report the agent ingests, keyed
+  by year and week. This is provenance: an auditable record of exactly what text the agent
+  read on a given day, linked from `health_reports`.
+- **AWS App Runner** — hosts the containerized FastAPI application and serves the public
+  demo URL.
+- **Amazon EventBridge Scheduler** — drives ingestion on a `rate(4 hours)` schedule via an
+  authenticated API destination.
+
+---
+
+## Data quality and calibration
+
+The analytics were validated against real data rather than assumed correct. Some findings
+that shaped the implementation:
+
+- **Minimum baseline window.** Z-scores are only emitted when at least 8 historical
+  observations exist. Early cold-start windows previously produced extreme scores
+  (z ≈ −6) computed against a near-empty baseline — mathematically valid, operationally
+  meaningless. These are now represented as insufficient history.
+- **Standard deviation floor.** Quiet-season baselines can have near-zero variance, which
+  turns epidemiologically trivial fluctuations into large z-scores. The denominator is
+  floored to prevent noise amplification.
+- **Directional severity.** Severity is computed deterministically in Python from the
+  z-score — not left to LLM discretion — and carries direction. Rising activity drives
+  watch/alert severity; declining activity is reported as declining rather than being
+  treated as an equivalent outbreak signal merely because `|z|` is large. The LLM's role is
+  to explain and contextualize the computed severity, not to override it.
+- **Known coverage gaps, handled explicitly.** Texas is not a RESP-NET catchment state, so
+  it will only ever carry a flu signal. New York currently has no recent ILINet data. Both
+  are surfaced in the dashboard as labeled data-gap states rather than rendering as
+  misleading empty charts.
+
+---
+
+## API
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Liveness check |
+| `GET /signals/{signal_type}/{region}` | Recent time series for one signal/region |
+| `GET /rankings` | All region/signal combinations ranked by anomaly magnitude |
+| `GET /reports/search?q=` | Semantic search over CDC narrative reports (vector search) |
+| `GET /regions/{region}/closest-match` | Cross-region pattern matching |
+| `GET /alerts` | Recent alerts |
+| `POST /alerts/{alert_id}/transition` | Move an alert through its lifecycle |
+| `GET /alerts/{alert_id}/history` | Full state-transition history for one alert |
+| `GET /audit` | Recent audit log entries |
+| `POST /trigger/ingest` | Run one ingest cycle manually (authenticated) |
+| `POST /trigger/agent/{signal_type}/{region}` | Run one agent cycle, returns full trace (authenticated) |
+| `GET /dashboard` | Web dashboard |
+
+---
 
 ## Setup
 
-1. **CockroachDB**: create a free cluster at cockroachlabs.cloud, grab the connection string,
-   run `app/schema.sql` against it.
-2. **AWS**: make sure you have Bedrock model access enabled (Titan Embeddings + a Claude
-   model) in your target region, and an IAM role/credentials with `bedrock:InvokeModel`.
-3. Copy `.env.example` to `.env` and fill in `DATABASE_URL` and AWS region/model IDs.
-4. `pip install -r requirements.txt`
-5. Run locally: `uvicorn app.main:app --reload`
-6. Run one ingest cycle manually: `python -m app.ingest`
-7. Run one agent reasoning cycle manually: `python -m app.agent`
+### 1. CockroachDB
 
-## Deploying the cron ingestion
+Create a free cluster at [cockroachlabs.cloud](https://cockroachlabs.cloud), then:
 
-Package `app/` + `lambda_handler.py` as a Lambda deployment (or container image), and create
-an EventBridge Scheduler rule with a `rate(4 hours)` expression pointing at it. Keep the
-FastAPI app running separately (ECS/EC2/App Runner) for the interactive querying + demo UI.
+```bash
+psql "$DATABASE_URL" -f app/schema.sql
+```
 
-## Data source note
+### 2. Groq
 
-CDC publishes several public APIs/datasets (e.g. FluView, COVID Data Tracker) via
-data.cdc.gov (Socrata). `app/ingest.py` has a placeholder `fetch_cdc_data()` - swap in the
-specific dataset endpoint you choose once you've picked your exact signal (see README TODO
-in that file). Keep it to ONE signal and 2-3 regions for the hackathon scope.
+Get a free API key at [console.groq.com](https://console.groq.com). No approval wait, no
+credit card.
 
-# flu-surveillance-agent
-An agent that ingests CDC flu surveillance data, remembers historical patterns in CockroachDB, and generates auditable alerts using Bedrock reasoning
- 3c0be781d5651c2a7fc01e51bbc839d008d47250
+### 3. AWS
+
+Create an S3 bucket (block public access enabled) and an IAM user with `s3:PutObject` and
+`s3:GetObject` scoped to that bucket only.
+
+### 4. Environment
+
+```bash
+cp .env.example .env
+```
+
+Fill in:
+
+```
+DATABASE_URL=postgresql://...
+GROQ_API_KEY=gsk_...
+GROQ_MODEL=llama-3.3-70b-versatile
+EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+S3_BUCKET=your-bucket
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+TRIGGER_SECRET=...
+```
+
+### 5. Run
+
+```bash
+pip install -r requirements.txt
+python -m app.ingest          # fetch real CDC data
+python -m app.seed_reports    # embed FluView narratives
+python -m app.agent           # run one reasoning cycle
+uvicorn app.main:app --reload # http://localhost:8000/dashboard
+```
+
+### Local development with Docker
+
+```bash
+docker compose up
+```
+
+Starts the application alongside a local single-node CockroachDB, so the full stack runs
+without a cloud cluster.
+
+---
+
+## Deployment
+
+The application is a single container image serving both the API and the dashboard.
+
+1. Build and push the image to ECR.
+2. Create an App Runner service from that image (port 8080, ≥2 GB memory — the embedding
+   model needs headroom), with the environment variables above and an instance role
+   carrying the scoped S3 permissions.
+3. Create an EventBridge Scheduler schedule on `rate(4 hours)` targeting an API destination
+   pointed at `POST /trigger/ingest`, with the `TRIGGER_SECRET` header attached.
+
+AWS Lambda was evaluated and not used: local embedding inference requires
+`sentence-transformers` and `torch`, which exceed the zip-packaged Lambda size limit. Rather
+than maintain a second container-image deploy artifact alongside the API container, ingestion
+is triggered on the already-deployed service.
+
+---
+
+## License
+
+MIT
