@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS health_reports (
     content STRING NOT NULL,
     region STRING,
     published_date DATE,
-    embedding VECTOR(1024),           -- matches Titan Embed Text v2 dimension
+    embedding VECTOR(384),             -- matches BAAI/bge-small-en-v1.5 dimension
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

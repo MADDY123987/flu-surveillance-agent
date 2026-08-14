@@ -7,133 +7,91 @@ vector-search past reports for similar situations -> ask the reasoning model to 
 and decide -> store the alert (or not) with its full reasoning trace.
 """
 
-import hashlib
 import json
-import random
-import boto3
-from app.config import (
-    AWS_REGION,
-    BEDROCK_EMBEDDING_MODEL_ID,
-    BEDROCK_REASONING_MODEL_ID,
-    MOCK_BEDROCK,
-    TARGET_REGIONS,
-    TARGET_SIGNAL,
-)
+from groq import Groq
+from app.config import GROQ_API_KEY, GROQ_MODEL, TARGET_REGIONS, TARGET_SIGNAL
 from app.db import get_recent_signals, search_similar_reports, insert_alert
+from app.embeddings import embed_text
 from app.features import compute_features
 
-EMBEDDING_DIMENSIONS = 1024  # matches Titan Embed Text v2 and health_reports.embedding
+client = Groq(api_key=GROQ_API_KEY)
 
-bedrock = None if MOCK_BEDROCK else boto3.client("bedrock-runtime", region_name=AWS_REGION)
-
-
-def _mock_embed_text(text: str) -> list[float]:
-    """
-    Deterministic stand-in for Bedrock Titan embeddings, for local dev without AWS
-    credentials. Same input text always produces the same vector, so DB round-trips
-    and API wiring can be tested - but these vectors carry NO real semantic meaning
-    (unlike a real embedding model, near-identical text does not reliably produce
-    nearby mock vectors). Real Bedrock is required to judge actual search quality.
-    """
-    seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16)
-    rng = random.Random(seed)
-    return [rng.uniform(-1.0, 1.0) for _ in range(EMBEDDING_DIMENSIONS)]
+# Severity is decided here, deterministically, from the z-score computed by
+# app.features.compute_features - not by the LLM. Groq's job is to explain and
+# contextualize a severity that's already been decided, not to choose it (see
+# HANDOFF.md validation notes: leaving severity to the model's free-text judgment
+# produced internally inconsistent output, e.g. meaningful_change=true paired with
+# severity="info" on a real threshold-crossing z-score).
+ALERT_Z_THRESHOLD = 2
+WATCH_Z_THRESHOLD = 1
 
 
-def embed_text(text: str) -> list[float]:
-    """Step: turn a description of the current situation into a vector for similarity search."""
-    if MOCK_BEDROCK:
-        return _mock_embed_text(text)
+def determine_severity(z_score: float | None) -> tuple[str, str]:
+    """Returns (severity, rule_fired) - rule_fired is a human-readable audit trail of why."""
+    if z_score is None:
+        return "info", "no z-score available (insufficient baseline variance)"
+    az = abs(z_score)
+    if az >= ALERT_Z_THRESHOLD:
+        return "alert", f"|z_score|={az:.2f} >= {ALERT_Z_THRESHOLD} -> alert"
+    if az >= WATCH_Z_THRESHOLD:
+        return "watch", f"|z_score|={az:.2f} >= {WATCH_Z_THRESHOLD} -> watch"
+    return "info", f"|z_score|={az:.2f} < {WATCH_Z_THRESHOLD} -> info"
 
-    resp = bedrock.invoke_model(
-        modelId=BEDROCK_EMBEDDING_MODEL_ID,
-        body=json.dumps({"inputText": text}),
-    )
-    body = json.loads(resp["body"].read())
-    return body["embedding"]
 
-
-def _mock_reason_and_decide(region: str, signal_type: str, features: dict, similar_reports: list[dict]) -> dict:
-    """
-    Deterministic stand-in for the Bedrock reasoning call, for local dev without AWS
-    credentials. Applies the same z_score thresholds a human analyst would use, so
-    alerts/watches generated this way are realistic enough to exercise the dashboard's
-    alert lifecycle and reasoning-trace UI. Real Bedrock is required for the actual
-    demo recording and for real-world use - this is not a substitute for LLM judgment.
-    """
-    z = features.get("z_score")
-    history_note = f" Closest historical report on file: \"{similar_reports[0]['title']}\"." if similar_reports else ""
-    if z is None:
-        return {
-            "meaningful_change": False,
-            "severity": "info",
-            "message": f"[MOCK_BEDROCK] Not enough baseline variance yet to compute a z-score for {signal_type} in {region}.",
-        }
-    if abs(z) >= 2:
-        return {
-            "meaningful_change": True,
-            "severity": "alert",
-            "message": (
-                f"[MOCK_BEDROCK] {signal_type} in {region} is {z:.2f} standard deviations from its recent "
-                f"baseline (latest value {features.get('latest_value')}).{history_note}"
-            ),
-        }
-    if abs(z) >= 1:
-        return {
-            "meaningful_change": True,
-            "severity": "watch",
-            "message": (
-                f"[MOCK_BEDROCK] {signal_type} in {region} is drifting from baseline (z-score {z:.2f}, "
-                f"latest value {features.get('latest_value')}).{history_note}"
-            ),
-        }
-    return {
-        "meaningful_change": False,
-        "severity": "info",
-        "message": f"[MOCK_BEDROCK] {signal_type} in {region} is within normal range (z-score {z:.2f}).",
-    }
+REPORT_SNIPPET_CHARS = 400  # keep the prompt within Groq's TPM limits - full text already
+                             # did its job in the vector search step; only a snippet is
+                             # needed here for the model to write 1-2 sentences of context
 
 
 def reason_and_decide(region: str, signal_type: str, recent: list[dict], features: dict, similar_reports: list[dict]) -> dict:
-    """Step: ask the reasoning model to compare current data against memory and decide."""
-    if MOCK_BEDROCK:
-        return _mock_reason_and_decide(region, signal_type, features, similar_reports)
+    """Step: severity is already decided (see determine_severity) - ask the reasoning
+    model only to explain/contextualize it against history, not to choose it."""
+    severity, rule_fired = determine_severity(features.get("z_score"))
+    meaningful_change = severity != "info"
 
-    prompt = f"""You are a public health surveillance analyst. Review the computed statistics
-and historical context below, then decide if this warrants an alert. The statistics have
-already been calculated for you - trust them rather than recomputing from the raw data.
+    report_snippets = [
+        {"title": r["title"], "published_date": r["published_date"], "excerpt": r["content"][:REPORT_SNIPPET_CHARS]}
+        for r in similar_reports
+    ]
+
+    prompt = f"""You are a public health surveillance analyst. A surveillance system has
+already computed the statistics below and, from a deterministic rule on the z-score, has
+already classified this reading as severity "{severity}" ({rule_fired}). Your job is NOT to
+choose or restate a severity - it's to write a one or two sentence plain-English explanation
+of why this reading does or doesn't look concerning, referencing the computed statistics and
+any similar historical reports below.
 
 Computed statistics for {signal_type} in {region}:
 {json.dumps(features, indent=2)}
-(z_score measures how many standard deviations the latest value is from its own recent
-baseline - a z_score above ~2 or below ~-2 is generally notable.)
 
 Raw recent readings (oldest to newest), for context only:
 {json.dumps(recent, indent=2)}
 
-Similar past reports/advisories found in memory:
-{json.dumps(similar_reports, indent=2)}
+Similar past reports/advisories found in memory (excerpts):
+{json.dumps(report_snippets, indent=2)}
 
 Respond ONLY with JSON in this exact shape, no other text:
 {{
-  "meaningful_change": true or false,
-  "severity": "info" or "watch" or "alert",
   "message": "one or two plain-English sentences explaining the situation and referencing history if relevant"
 }}"""
 
-    resp = bedrock.invoke_model(
-        modelId=BEDROCK_REASONING_MODEL_ID,
-        body=json.dumps(
-            {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 500,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-        ),
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a public health surveillance analyst."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
     )
-    body = json.loads(resp["body"].read())
-    raw_text = body["content"][0]["text"]
-    return json.loads(raw_text)
+    raw_text = response.choices[0].message.content
+    groq_context = json.loads(raw_text).get("message", "")
+
+    return {
+        "meaningful_change": meaningful_change,
+        "severity": severity,
+        "rule_fired": rule_fired,
+        "message": groq_context,
+    }
 
 
 def run_agent_cycle(region: str, signal_type: str):

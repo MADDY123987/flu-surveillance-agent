@@ -3,11 +3,11 @@ Cross-region pattern match: "closest historical match" for a region's current si
 shape, compared against OTHER regions' recent history - reuses the same embedding
 infrastructure as app/agent.py and app/seed_reports.py (no new tables, no new
 integrations). On-demand only (triggered from the dashboard by a button, not part of
-the periodic refresh loop) since it makes several Bedrock embedding calls per request.
+the periodic refresh loop) since it makes several embedding calls per request.
 """
 
 import math
-from app.agent import embed_text
+from app.embeddings import embed_text
 from app.config import TARGET_REGIONS
 from app.db import get_recent_signals, log_audit
 from app.features import compute_features

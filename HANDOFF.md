@@ -153,13 +153,14 @@ happens again, the answer is: re-read this document, don't re-derive it.
      - audit_log                 (every agent read/write)
         ^
         |
-   agent.py — single agent, 5-step loop (hand-built, calls Bedrock via boto3
-   directly, NOT the managed Bedrock Agents product):
+   agent.py — single agent, 5-step loop (hand-built, calls Groq directly via its
+   SDK, NOT the managed Bedrock Agents product):
      1. fetch_recent_signals()       <- CockroachDB
      2. compute_features()            -> z-score, week-over-week % change (real
                                           Python math, not left to the LLM)
      3. search_similar_reports()      <- CockroachDB vector search over FluView text
-     4. reason_and_decide()           -> Bedrock (Titan embed + Claude reason)
+     4. reason_and_decide()           -> app/embeddings.py (local BAAI/bge-small-en-v1.5
+                                          embed) + Groq (llama-3.3-70b-versatile reason)
      5. insert_alert() / transition_alert_state()  -> CockroachDB
         ^
         |
@@ -186,9 +187,14 @@ happens again, the answer is: re-read this document, don't re-derive it.
 ### AWS services used
 - **AWS Lambda** — runs the ingestion job on a schedule
 - **Amazon EventBridge Scheduler** — triggers Lambda every 4 hours (`rate(4 hours)`)
-- **Amazon Bedrock** — Titan Embeddings (`amazon.titan-embed-text-v2:0`) for
-  vectorizing text, and a Claude model for reasoning/decision steps, called
-  directly via boto3's `invoke_model`
+
+### LLM / embedding provider
+- **Local embeddings** — `BAAI/bge-small-en-v1.5` via `sentence-transformers`
+  (`app/embeddings.py`), run in-process, no cloud account needed. Replaces
+  Bedrock Titan Embeddings (see migration note below).
+- **Groq** — `llama-3.3-70b-versatile` via the official `groq` SDK, called
+  directly in `app/agent.py`'s `reason_and_decide()`. Replaces Bedrock's Claude
+  model for the reasoning/decision step.
 
 ---
 
@@ -215,7 +221,7 @@ CREATE TABLE health_reports (
     content STRING NOT NULL,
     region STRING,
     published_date DATE,
-    embedding VECTOR(1024),
+    embedding VECTOR(384),
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE VECTOR INDEX idx_reports_embedding ON health_reports (embedding);
@@ -411,9 +417,9 @@ section 9). Swap `DATABASE_URL` for the real Cloud connection string before depl
 
 1. Create a free CockroachDB Cloud cluster (cockroachlabs.cloud), AWS as provider.
    Run `app/schema.sql` against it.
-2. In AWS, enable Bedrock model access for Titan Embeddings + a Claude model.
-   Set up IAM credentials with `bedrock:InvokeModel`.
-3. Copy `.env.example` to `.env`, fill in `DATABASE_URL` and AWS config.
+2. Create a free Groq API key at console.groq.com. Local embeddings
+   (`sentence-transformers`) need no cloud account at all.
+3. Copy `.env.example` to `.env`, fill in `DATABASE_URL` and `GROQ_API_KEY`.
 4. `pip install -r requirements.txt`
 5. Confirm the RESP-NET resource ID (see section 4, source #2) and fill it into
    `app/ingest.py`.
@@ -521,3 +527,160 @@ CockroachDB from section 10:**
   narrow widths, and interaction polish (hover tooltips, expand/collapse
   animation) should still get one real look in a browser before the demo
   recording — the static checks above catch structural bugs, not visual ones.
+
+
+
+# Migration: AWS Bedrock -> Groq + local embeddings
+
+Scope: ONLY the LLM/embedding provider changes. Do not touch anything else —
+no S3, no /upload or /chat endpoints, no Vercel frontend, no schema tables
+beyond the vector dimension fix below. Everything in HANDOFF.md section 3
+(locked scope) and section 4 (regions/data sources) stays exactly as-is. This
+was confirmed explicitly: "only we are shifting from aws bedrock to groq,
+that's it."
+
+Why this is safe to do: it actually reduces risk. Bedrock model access was
+the single biggest schedule risk (approval can lag days). Groq's API key is
+instant, and local embeddings need no cloud account at all. The MOCK_BEDROCK
+flag can be removed entirely once this is done — nothing left needs mocking,
+since neither Groq nor local embeddings require waiting on approval.
+
+## 1. requirements.txt
+
+- Remove `boto3` if nothing else in the app calls AWS APIs directly (Lambda
+  itself doesn't need boto3 to be invoked — only code that calls S3/Bedrock/etc.
+  needs it as a dependency). Check ingest.py / agent.py for other boto3 uses
+  before removing.
+- Add `groq` (official Groq Python SDK)
+- Add `sentence-transformers` (for BAAI/bge-small-en-v1.5)
+
+Note for later: sentence-transformers pulls in torch, which is large. This is
+fine for local dev and for the FastAPI app process. It becomes relevant again
+at Lambda deployment time (see note at the bottom) — not a concern today.
+
+## 2. app/config.py
+
+- Remove: BEDROCK_REGION, Bedrock model ID(s), MOCK_BEDROCK
+- Add:
+  - `GROQ_API_KEY` (from env, no default — fail loudly if missing)
+  - `GROQ_MODEL` (default `"llama-3.3-70b-versatile"`)
+  - `EMBEDDING_MODEL_NAME` (default `"BAAI/bge-small-en-v1.5"`)
+
+## 3. New file: app/embeddings.py
+
+Single shared function so the model is loaded once (singleton), not reloaded
+on every call — this matters for the FastAPI process and for seed_reports.py
+performance.
+
+```python
+from sentence_transformers import SentenceTransformer
+from app.config import EMBEDDING_MODEL_NAME
+
+_model = None
+
+def get_embedding_model():
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _model
+
+def embed_text(text: str) -> list[float]:
+    model = get_embedding_model()
+    return model.encode(text, normalize_embeddings=True).tolist()
+```
+
+Replace every place that currently calls Bedrock's Titan embed (in
+seed_reports.py, ingest.py / fluview.py if it embeds at insert time, and
+wherever search_similar_reports() builds a query embedding in agent.py) with
+`embed_text(...)` from this module.
+
+## 4. app/agent.py — reason_and_decide()
+
+Replace the boto3 `bedrock-runtime.invoke_model(...)` call with:
+
+```python
+from groq import Groq
+from app.config import GROQ_API_KEY, GROQ_MODEL
+
+client = Groq(api_key=GROQ_API_KEY)
+
+def reason_and_decide(signal_context, similar_reports, features):
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": "<same system prompt as before>"},
+            {"role": "user", "content": "<same prompt construction as before, using signal_context / similar_reports / features>"},
+        ],
+        temperature=0.2,
+    )
+    return response.choices[0].message.content
+```
+
+Keep the existing prompt construction and existing return-value handling
+(whatever agent.py currently does with the model's output — e.g. parsing
+JSON, deciding severity, etc.) — only the client/call changes, not the logic
+around it.
+
+## 5. app/schema.sql
+
+```sql
+embedding VECTOR(1024)   -- Titan dimension, old
+```
+becomes
+```sql
+embedding VECTOR(384)    -- BAAI/bge-small-en-v1.5 dimension
+```
+
+Since this is still local-only (no CockroachDB Cloud cluster created yet),
+just drop and recreate `health_reports` (and its vector index) against the
+local Docker instance — no real data to preserve.
+
+## 6. .env.example
+
+- Remove Bedrock-specific vars if AWS creds aren't needed for anything else
+  right now (Lambda/EventBridge deployment will need AWS creds again later,
+  but that's a separate, later step — don't remove AWS entirely from the
+  project, just from the LLM/embedding path)
+- Add `GROQ_API_KEY=` (get a free key at console.groq.com)
+
+## 7. HANDOFF.md updates
+
+- Section 5 (architecture): reasoning step now calls Groq directly, not
+  Bedrock; embeddings are generated locally via BAAI/bge-small-en-v1.5, not
+  Titan.
+- Section 10 (setup steps): remove "enable AWS Bedrock model access" — replace
+  with "create a free Groq API key at console.groq.com."
+- AWS service requirement (hackathon needs at least 1): still satisfied via
+  Lambda + EventBridge for scheduled ingestion — Bedrock was never the only
+  AWS service in the plan, so dropping it doesn't put you below the
+  requirement.
+- Note explicitly in a new subsection that MOCK_BEDROCK was removed and why
+  (no longer needed — Groq + local embeddings need no cloud approval).
+
+## 8. Verify
+
+Recreate the local schema, rerun `seed_reports.py`, `ingest.py`, and
+`agent.py` end to end against the local Docker CockroachDB — this is now a
+REAL run, not a mock, since neither Groq nor local embeddings need mocking.
+Confirm the dashboard, semantic search, and cross-region match still work
+with 384-dim vectors.
+
+## 9. MOCK_BEDROCK removed
+
+The `MOCK_BEDROCK` flag (`app/config.py`, previously used throughout
+`app/agent.py`) has been deleted entirely, along with its mock embedding and
+mock reasoning code paths. It existed solely to let the pipeline be exercised
+without AWS Bedrock model-access approval, which could lag days. Neither Groq
+(instant API key) nor local `sentence-transformers` embeddings (no cloud
+account at all) have that approval-lag problem, so there is nothing left to
+mock — every code path now makes a real call.
+
+---
+
+**Heads-up for later, not now:** when you get to deploying the ingestion
+Lambda (HANDOFF.md section 10, step 10), if `ingest.py`/`fluview.py` generates
+embeddings inline (rather than only at seed time), the Lambda package will
+need to include `sentence-transformers` + `torch`, which likely exceeds a
+plain zip-based Lambda's size limit. At that point you'll probably want a
+container-image Lambda instead of a zip package. Not a blocker today — just
+don't be surprised by it during the deploy step.

@@ -7,6 +7,14 @@ to reason over, not just data to crunch.
 
 import statistics
 
+# Below this, a baseline's stdev reflects reporting noise around a flat signal, not real
+# variance - dividing by it inflates ordinary wobbles into z-scores that look alarming.
+# Empirically chosen from live CDC data (see HANDOFF.md validation notes): quiet-season
+# regional stdevs cluster ~0.06-0.19 across all 3 signal types, while genuine peak-season
+# stdevs run ~0.39-1.76. 0.15 sits above typical quiet-season noise without suppressing
+# real peak-season movement.
+STDEV_FLOOR = 0.15
+
 
 def compute_features(recent: list[dict]) -> dict:
     """
@@ -28,7 +36,7 @@ def compute_features(recent: list[dict]) -> dict:
     baseline_mean = statistics.mean(baseline)
     baseline_stdev = statistics.stdev(baseline) if len(baseline) > 1 else 0
 
-    z_score = (latest - baseline_mean) / baseline_stdev if baseline_stdev > 0 else None
+    z_score = (latest - baseline_mean) / max(baseline_stdev, STDEV_FLOOR)
 
     return {
         "latest_value": latest,
@@ -36,6 +44,6 @@ def compute_features(recent: list[dict]) -> dict:
         "week_over_week_pct_change": round(week_over_week_pct_change, 1) if week_over_week_pct_change is not None else None,
         "baseline_mean": round(baseline_mean, 2),
         "baseline_stdev": round(baseline_stdev, 2),
-        "z_score": round(z_score, 2) if z_score is not None else None,
+        "z_score": round(z_score, 2),
         "insufficient_data": False,
     }

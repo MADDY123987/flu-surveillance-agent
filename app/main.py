@@ -70,7 +70,7 @@ def closest_match(region: str, signal_type: str):
     compares this region's current signal shape against other regions' recent history
     using the same embedding infrastructure as /reports/search - no new tables, no new
     integrations. On-demand only - deliberately not part of the periodic dashboard
-    refresh, since it makes several Bedrock embedding calls per request.
+    refresh, since it makes several embedding calls per request.
     """
     result = find_closest_match(region, signal_type)
     if result is None:

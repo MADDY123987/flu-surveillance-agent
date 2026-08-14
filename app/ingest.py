@@ -40,18 +40,25 @@ def _epiweek_to_date(epiweek: int) -> str:
     return datetime.fromisocalendar(year, week, 1).date().isoformat()
 
 
-def fetch_cdc_data(region: str) -> list[dict]:
-    """Pull the last ~8 weeks of ILI data for one region from the Delphi Epidata API."""
+def fetch_cdc_data(region: str, epiweek_range: str | None = None) -> list[dict]:
+    """
+    Pull ILI data for one region from the Delphi Epidata API. Defaults to the last ~8
+    weeks (the regular rolling window this function is called with every 4h); pass an
+    explicit epiweek_range (e.g. "202601-202615") to pull a specific historical window
+    instead, for one-off backfills - see run_backfill().
+    """
     region_code = STATE_TO_REGION_CODE.get(region)
     if region_code is None:
         raise ValueError(f"No Delphi region code mapped for '{region}' - add it to STATE_TO_REGION_CODE")
 
-    current = _current_epiweek()
-    start = current - 8  # rough 8-week lookback; fine even if it crosses a year boundary loosely
+    if epiweek_range is None:
+        current = _current_epiweek()
+        start = current - 8  # rough 8-week lookback; fine even if it crosses a year boundary loosely
+        epiweek_range = f"{start}-{current}"
 
     resp = requests.get(
         DELPHI_BASE_URL,
-        params={"regions": region_code, "epiweeks": f"{start}-{current}"},
+        params={"regions": region_code, "epiweeks": epiweek_range},
         timeout=15,
     )
     resp.raise_for_status()
@@ -125,22 +132,32 @@ RESPNET_REGION_MAP = {
 }
 
 
-def fetch_respnet_data(region: str, network_label: str) -> list[dict]:
-    """Pull recent RESP-NET hospitalization rates for one disease network + region."""
+def fetch_respnet_data(region: str, network_label: str, date_range: tuple[str, str] | None = None) -> list[dict]:
+    """
+    Pull RESP-NET hospitalization rates for one disease network + region. Defaults to
+    the most recent 12 weekly rows (the regular call, no date filter); pass an explicit
+    date_range (start, end) as 'YYYY-MM-DD' strings to pull a specific historical window
+    instead, for one-off backfills - see run_backfill().
+    """
     respnet_state = RESPNET_REGION_MAP.get(region)
     if respnet_state is None:
         return []  # region has no RESP-NET catchment site - expected, not an error
 
+    where_clause = (
+        f"surveillance_network='{network_label}' AND state='{respnet_state}' "
+        "AND data_type='Weekly Rate' AND age_category='Overall' AND rate_type='Observed' "
+        "AND sex='All' AND race='All'"
+    )
+    if date_range is not None:
+        start, end = date_range
+        where_clause += f" AND date >= '{start}' AND date <= '{end}'"
+
     resp = requests.get(
         RESPNET_BASE_URL,
         params={
-            "$where": (
-                f"surveillance_network='{network_label}' AND state='{respnet_state}' "
-                "AND data_type='Weekly Rate' AND age_category='Overall' AND rate_type='Observed' "
-                "AND sex='All' AND race='All'"
-            ),
+            "$where": where_clause,
             "$order": "date DESC",
-            "$limit": 12,
+            "$limit": 30 if date_range is not None else 12,
         },
         timeout=15,
     )
@@ -156,51 +173,73 @@ def fetch_respnet_data(region: str, network_label: str) -> list[dict]:
     return records
 
 
-def run_ingest():
-    results = {"regions_processed": 0, "records_stored": 0, "records_dropped": 0}
-    for region in TARGET_REGIONS:
-        # Signal 1: flu, from Delphi/ILINet (already working)
-        raw_records = fetch_cdc_data(region)
+def _ingest_region(region: str, results: dict, epiweek_range: str | None = None, respnet_date_range: tuple[str, str] | None = None):
+    # Signal 1: flu, from Delphi/ILINet (already working)
+    raw_records = fetch_cdc_data(region, epiweek_range=epiweek_range)
+    for raw in raw_records:
+        cleaned = clean_record(raw)
+        if cleaned is None:
+            results["records_dropped"] += 1
+            continue
+        upsert_signal(
+            source="cdc_ilinet",
+            signal_type=TARGET_SIGNAL,
+            region=region,
+            observed_date=cleaned["observed_date"],
+            value=cleaned["value"],
+        )
+        results["records_stored"] += 1
+
+    # Signals 2 & 3: COVID-19 and RSV, from RESP-NET (fill in RESPNET_RESOURCE_ID first)
+    for signal_type, network_label in RESPNET_SIGNAL_MAP.items():
+        try:
+            raw_records = fetch_respnet_data(region, network_label, date_range=respnet_date_range)
+        except NotImplementedError as e:
+            print(f"[ingest] Skipping {signal_type}: {e}")
+            continue
         for raw in raw_records:
             cleaned = clean_record(raw)
             if cleaned is None:
                 results["records_dropped"] += 1
                 continue
             upsert_signal(
-                source="cdc_ilinet",
-                signal_type=TARGET_SIGNAL,
+                source="cdc_respnet",
+                signal_type=signal_type,
                 region=region,
                 observed_date=cleaned["observed_date"],
                 value=cleaned["value"],
             )
             results["records_stored"] += 1
 
-        # Signals 2 & 3: COVID-19 and RSV, from RESP-NET (fill in RESPNET_RESOURCE_ID first)
-        for signal_type, network_label in RESPNET_SIGNAL_MAP.items():
-            try:
-                raw_records = fetch_respnet_data(region, network_label)
-            except NotImplementedError as e:
-                print(f"[ingest] Skipping {signal_type}: {e}")
-                continue
-            for raw in raw_records:
-                cleaned = clean_record(raw)
-                if cleaned is None:
-                    results["records_dropped"] += 1
-                    continue
-                upsert_signal(
-                    source="cdc_respnet",
-                    signal_type=signal_type,
-                    region=region,
-                    observed_date=cleaned["observed_date"],
-                    value=cleaned["value"],
-                )
-                results["records_stored"] += 1
+    results["regions_processed"] += 1
 
-        results["regions_processed"] += 1
+
+def run_ingest():
+    """Regular ingest cycle - the rolling ~8-week window, called every 4h by Lambda."""
+    results = {"regions_processed": 0, "records_stored": 0, "records_dropped": 0}
+    for region in TARGET_REGIONS:
+        _ingest_region(region, results)
 
     print(f"[ingest] {date.today()} run complete: {results}")
     return results
 
 
+def run_backfill(epiweek_range: str = "202601-202615", respnet_date_range: tuple[str, str] = ("2026-01-01", "2026-04-15")):
+    """
+    One-off historical backfill (e.g. to get real peak-season data for validation) -
+    not part of the regular 4h ingest cycle, not wired into Lambda/EventBridge.
+    """
+    results = {"regions_processed": 0, "records_stored": 0, "records_dropped": 0}
+    for region in TARGET_REGIONS:
+        _ingest_region(region, results, epiweek_range=epiweek_range, respnet_date_range=respnet_date_range)
+
+    print(f"[ingest] backfill ({epiweek_range}) complete: {results}")
+    return results
+
+
 if __name__ == "__main__":
-    run_ingest()
+    import sys
+    if "--backfill" in sys.argv:
+        run_backfill()
+    else:
+        run_ingest()

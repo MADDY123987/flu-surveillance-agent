@@ -3,7 +3,8 @@ uvicorn[standard]
 sqlalchemy
 sqlalchemy-cockroachdb
 psycopg[binary]
-boto3
+groq
+sentence-transformers
 python-dotenv
 requests
 pydantic
