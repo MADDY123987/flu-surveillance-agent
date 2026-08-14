@@ -37,7 +37,13 @@ def _epiweek_to_date(epiweek: int) -> str:
     """Convert an epiweek (e.g. 202632) to that week's Monday date, for storage as observed_date."""
     year = epiweek // 100
     week = epiweek % 100
-    return datetime.fromisocalendar(year, week, 1).date().isoformat()
+    try:
+        return datetime.fromisocalendar(year, week, 1).date().isoformat()
+    except ValueError:
+        # CDC's epiweek numbering isn't strictly ISO - some years it reaches a week 53
+        # that ISO's calendar doesn't have for that year. Approximate as one week past
+        # ISO week 52, consistent with this function's existing documented approximation.
+        return (datetime.fromisocalendar(year, 52, 1) + timedelta(weeks=1)).date().isoformat()
 
 
 def fetch_cdc_data(region: str, epiweek_range: str | None = None) -> list[dict]:
@@ -157,7 +163,7 @@ def fetch_respnet_data(region: str, network_label: str, date_range: tuple[str, s
         params={
             "$where": where_clause,
             "$order": "date DESC",
-            "$limit": 30 if date_range is not None else 12,
+            "$limit": 300 if date_range is not None else 12,  # 300 covers ~2 years of weekly rows
         },
         timeout=15,
     )
@@ -224,16 +230,28 @@ def run_ingest():
     return results
 
 
-def run_backfill(epiweek_range: str = "202601-202615", respnet_date_range: tuple[str, str] = ("2026-01-01", "2026-04-15")):
+BACKFILL_START_EPIWEEK = 202440  # ~Sept 2024; deliberately continuous, no gaps (see HANDOFF.md)
+
+
+def run_backfill(epiweek_range: str | None = None, respnet_date_range: tuple[str, str] | None = None):
     """
-    One-off historical backfill (e.g. to get real peak-season data for validation) -
-    not part of the regular 4h ingest cycle, not wired into Lambda/EventBridge.
+    One-off historical backfill for a continuous, unbroken date range (default:
+    BACKFILL_START_EPIWEEK through today) - not part of the regular 4h ingest cycle,
+    not wired into Lambda/EventBridge. A single range query per region/source (the
+    Delphi and Socrata APIs both accept a date/epiweek range directly), not one call
+    per week, so this stays fast and continuous by construction - no gaps get
+    introduced the way separate disjoint backfill windows previously did.
     """
+    if epiweek_range is None:
+        epiweek_range = f"{BACKFILL_START_EPIWEEK}-{_current_epiweek()}"
+    if respnet_date_range is None:
+        respnet_date_range = (_epiweek_to_date(BACKFILL_START_EPIWEEK), date.today().isoformat())
+
     results = {"regions_processed": 0, "records_stored": 0, "records_dropped": 0}
     for region in TARGET_REGIONS:
         _ingest_region(region, results, epiweek_range=epiweek_range, respnet_date_range=respnet_date_range)
 
-    print(f"[ingest] backfill ({epiweek_range}) complete: {results}")
+    print(f"[ingest] backfill ({epiweek_range}, respnet {respnet_date_range}) complete: {results}")
     return results
 
 
