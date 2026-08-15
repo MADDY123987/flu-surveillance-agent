@@ -9,3 +9,4 @@ python-dotenv
 requests
 pydantic
 beautifulsoup4
+pytest

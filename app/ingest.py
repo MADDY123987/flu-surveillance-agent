@@ -19,11 +19,26 @@ DELPHI_BASE_URL = "https://api.delphi.cmu.edu/epidata/fluview/"
 
 # Delphi/CDC region codes for the states in scope. Add more here if you widen TARGET_REGIONS.
 # Full list of valid codes: https://cmu-delphi.github.io/delphi-epidata/api/geographic_codes.html
+#
+# The 7 states added beyond the original 4 (Colorado/Georgia/Maryland/Michigan/Minnesota/
+# New Mexico/Tennessee) were chosen empirically, not assumed: RESP-NET catchment is the
+# binding constraint (ILINet nominally covers all states), so candidates were drawn from
+# states with deep, current COVID-NET + RSV-NET coverage, then filtered again by actual
+# ILINet freshness per state - which excluded Connecticut, Oregon, and Utah despite having
+# current RESP-NET data, because they (along with New York) stopped reporting ILINet at
+# the exact same epiweek (202539, 2025-09-22) - see HANDOFF.md section 9 for the finding.
 STATE_TO_REGION_CODE = {
     "US": "nat",
     "California": "ca",
     "Texas": "tx",
     "New York": "ny",
+    "Colorado": "co",
+    "Georgia": "ga",
+    "Maryland": "md",
+    "Michigan": "mi",
+    "Minnesota": "mn",
+    "New Mexico": "nm",
+    "Tennessee": "tn",
 }
 
 
@@ -116,11 +131,13 @@ def clean_record(raw: dict) -> dict | None:
 #   the table has separate rows broken out by sex and by race, so omitting these filters
 #   returns multiple duplicate-looking rows per date
 # - IMPORTANT: RESP-NET's catchment is a subset of states, not all 50 - Texas is NOT a
-#   participating site for COVID-NET or RSV-NET. Of our 4 locked regions, only
-#   California and New York (plus the 'Overall' national aggregate) have RESP-NET data;
-#   Texas will only ever have the ILINet flu signal. This is a real data-availability
-#   gap, not a bug - fetch_respnet_data() returns [] for unmapped regions rather than
-#   erroring, and run_ingest() just stores fewer records for Texas.
+#   participating site for COVID-NET or RSV-NET, so it will only ever have the ILINet
+#   flu signal. This is a real data-availability gap, not a bug - fetch_respnet_data()
+#   returns [] for unmapped regions rather than erroring, and run_ingest() just stores
+#   fewer records for Texas. RESP-NET catchment was in fact the binding constraint used
+#   to pick the 7 states added beyond the original 4 (see STATE_TO_REGION_CODE above and
+#   HANDOFF.md section 4) - all of them were confirmed to have deep, current COVID-NET
+#   and RSV-NET coverage before being added.
 RESPNET_RESOURCE_ID = "kvib-3txy"
 RESPNET_BASE_URL = f"https://data.cdc.gov/resource/{RESPNET_RESOURCE_ID}.json"
 
@@ -134,6 +151,13 @@ RESPNET_REGION_MAP = {
     "US": "Overall",
     "California": "California",
     "New York": "New York",
+    "Colorado": "Colorado",
+    "Georgia": "Georgia",
+    "Maryland": "Maryland",
+    "Michigan": "Michigan",
+    "Minnesota": "Minnesota",
+    "New Mexico": "New Mexico",
+    "Tennessee": "Tennessee",
     # Texas intentionally omitted - not a RESP-NET catchment state, see note above.
 }
 

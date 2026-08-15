@@ -111,8 +111,13 @@ happens again, the answer is: re-read this document, don't re-derive it.
 
 ## 4. Final locked scope
 
-- **Regions:** US National + California + Texas + New York (all 50 states is an
-  optional Day 7 stretch goal only, see day plan)
+- **Regions:** US National + 10 states — the original 4 (California, Texas, New York)
+  plus 7 added via an empirical coverage check (Colorado, Georgia, Maryland, Michigan,
+  Minnesota, New Mexico, Tennessee). **This superseded the original 4-region scope** —
+  see the "Region expansion" section near the end of this document for the full
+  coverage table, selection rationale, and a real data-quality finding (simultaneous
+  ILINet reporting-group stoppage) discovered while doing the selection. All 50 states
+  remains an optional stretch goal beyond this.
 - **Data sources (3):**
   1. **CDC ILINet** via the CMU Delphi Epidata API — flu-like illness rate.
      Endpoint: `https://api.delphi.cmu.edu/epidata/fluview/`
@@ -684,3 +689,191 @@ need to include `sentence-transformers` + `torch`, which likely exceeds a
 plain zip-based Lambda's size limit. At that point you'll probably want a
 container-image Lambda instead of a zip package. Not a blocker today — just
 don't be surprised by it during the deploy step.
+
+---
+
+# Region expansion: 4 -> 11 regions
+
+Scope: only `TARGET_REGIONS` and the region-code mapping tables it depends on
+(`app/ingest.py`'s `STATE_TO_REGION_CODE` / `RESPNET_REGION_MAP`). No changes to the
+z-score formula, `STDEV_FLOOR`, `MIN_BASELINE_OBSERVATIONS`, or
+`FRESHNESS_THRESHOLD_DAYS` — those stay exactly as validated. No deployment/Docker/S3/AWS
+work touched.
+
+## Why: the original 4-region scope wasn't representative of how the pipeline behaves
+across regions with different data availability. Expanding it to a real, empirically
+selected multi-state set makes it possible to see where the deterministic pipeline
+(features -> direction -> severity -> freshness) generalizes and where it doesn't,
+instead of only ever exercising it against 4 regions whose quirks (Texas's missing
+RESP-NET, New York's stale ILINet) were already known and specifically chosen for.
+
+## Region selection is empirical, not assumed
+
+ILINet nominally covers all 50 states, so it isn't the limiting factor - **RESP-NET
+catchment is the binding constraint** (a real minority of states participate in
+COVID-NET/RSV-NET at all). Selection process:
+
+1. Queried the RESP-NET dataset (Socrata `$group` by `state, surveillance_network`) for
+   every state with COVID-NET and RSV-NET data, and how recent each state's newest row is.
+2. For every RESP-NET-covered candidate, separately checked actual ILINet freshness for
+   that specific state via Delphi - **coverage does not imply freshness**, per New York's
+   own 327-day-stale ILINet feed discovered in an earlier validation pass. Assuming
+   "ILINet covers all states" without checking would have silently re-introduced the same
+   class of bug the freshness guard was built to catch.
+3. Kept only states current (as of 2026-08-08 for RESP-NET / 2026-07-27 for ILINet) in
+   both sources, with deep RESP-NET history (n≈336-389 weekly rows, i.e. a long-standing
+   catchment site, not a sparse recent addition).
+
+### Coverage table (as queried; RESP-NET freshness via grouped Socrata query, ILINet via Delphi)
+
+| State | RESP-NET (COVID-NET + RSV-NET) | ILINet | Decision |
+|---|---|---|---|
+| US (`Overall`) | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| California | current, 2026-08-08 | current, 2026-07-27 | **include** (original 4) |
+| Texas | not a catchment state (no data at all) | current, 2026-07-27 | **include** (original 4 - the RESP-NET no-data-gap demo) |
+| New York | current, 2026-08-08 | **stale, 327d (2025-09-22)** | **include** (original 4 - the ILINet staleness demo) |
+| Colorado | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| Georgia | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| Maryland | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| Michigan | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| Minnesota | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| New Mexico | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| Tennessee | current, 2026-08-08 | current, 2026-07-27 | **include** |
+| Connecticut | current, 2026-08-08 | **stale, 327d (2025-09-22)** | reject - ILINet stale |
+| Oregon | current, 2026-08-08 | **stale, 327d (2025-09-22)** | reject - ILINet stale |
+| Utah | current, 2026-08-08 | **stale, 327d (2025-09-22)** | reject - ILINet stale |
+| Iowa | stale (COVID-NET last 2022-05, no RSV-NET) | — not checked, already disqualified | reject - RESP-NET stale |
+| Ohio | stale (last 2024-09 / 2025-05, no RSV-NET) | — not checked, already disqualified | reject - RESP-NET stale |
+| Washington | current but sparse (n=45, recent addition) | — not checked, deprioritized | not selected (had 8 states already; this one's a thin/new catchment site, weaker baseline history) |
+
+**Final list (11): US, California, Texas, New York, Colorado, Georgia, Maryland,
+Michigan, Minnesota, New Mexico, Tennessee.** Texas and New York were deliberately
+kept despite their known gaps rather than dropped in favor of "cleaner" states - they
+are the only regions in the set that exercise the RESP-NET no-data path and the ILINet
+freshness-guard path against real data. Dropping them would remove that coverage
+entirely from the running system.
+
+## Finding: a real, multi-state ILINet reporting-group stoppage (epiweek 202539)
+
+While checking ILINet freshness per candidate state, four states — **Connecticut, New
+York, Oregon, and Utah** — turned out to share the *exact same* last-reported epiweek
+(**202539**, week ending **2025-09-22**) and therefore the identical 327-day staleness.
+This is not coincidental and not an artifact of the query: it's strong evidence these
+four states belong to the same ILINet reporting group/lab network that stopped
+submitting data simultaneously around September 2025. This reframes New York's earlier
+gap (originally investigated in isolation, see the NY z=2.72 false-alert finding) as one
+instance of a broader, real CDC-source data-quality issue rather than a New-York-specific
+anomaly. None of the four made it into the 11-region set; all were excluded purely
+because their ILINet feed is stale, independent of their (otherwise current) RESP-NET
+coverage.
+
+## Runtime configuration
+
+`TARGET_REGIONS` in `.env`/`.env.example` and its default in `app/config.py` now list
+all 11 regions - this is the actual runtime list the live agent monitors, not just
+backfilled data sitting unused in the database. `app/ingest.py`'s `STATE_TO_REGION_CODE`
+and `RESPNET_REGION_MAP` were extended with the 7 new states' Delphi/RESP-NET codes so
+the regular scheduled `run_ingest()` (and the one-off `run_backfill()`) both work against
+the expanded list without modification to their logic.
+
+---
+
+# Retrieval fix: query construction + an empirical relevance threshold
+
+## The problem
+
+`health_reports` only ever contains CDC FluView narrative text - flu content, never
+covid/rsv. But `app.agent.run_agent_cycle()` calls `search_similar_reports()` for
+**every** signal type, including `covid19_hospitalization` and `rsv_hospitalization`,
+and the function always returns its top-k nearest neighbors regardless of how far away
+they actually are. In practice this meant every covid/rsv alert's reasoning trace cited
+3 "similar historical reports" that were really just the least-irrelevant flu reports in
+memory - a real correctness bug in what the agent presents as retrieved evidence, not a
+cosmetic one.
+
+Separately, the query side had the same "raw numeric embedding" flaw that had already
+been identified and fixed on the *content* side (see the FluView narrative-scraper
+decision in section 3) but never on the *query* side: `situation_text` was still being
+built as a bare numeric statement, e.g. `"flu_like_illness in California was 1.6 as of
+2026-08-01"` - not the register CDC's own narrative prose uses, so even genuine flu
+queries were retrieving on weaker signal than they should.
+
+## Fix 1: query construction (`app/agent.py::build_situation_text`)
+
+Replaced the bare numeric string with a short surveillance-style sentence built from the
+same computed features already available at that point in the loop (direction, week-
+over-week % change, z-score), e.g. `"Surveillance update: influenza-like illness
+activity in California is rising relative to its recent baseline, currently at 5.79 as
+of 2026-01-26 (week-over-week change 12.3%, z-score 2.1)."` - closer to the register
+FluView's own narrative reports use.
+
+## Fix 2: empirical relevance threshold (`REPORT_RELEVANCE_MAX_DISTANCE`, `app/config.py`)
+
+No prior threshold existed. Derived one by embedding the real, current `build_situation_text`
+query for every (region, signal_type) combination across all 11 `TARGET_REGIONS` x 3
+signal types, running an unfiltered top-10 vector search against `health_reports`, and
+taking each query's best (smallest) distance - L2 on normalized 384-dim embeddings, range
+[0, 2], lower = more similar:
+
+| Group | n | min | max | mean |
+|---|---|---|---|---|
+| `flu_like_illness` (relevant content exists) | 11 | 0.544 | 0.637 | 0.612 |
+| `covid19_hospitalization` / `rsv_hospitalization` (no relevant content exists) | 20 | 0.727 | 0.829 | 0.782 |
+
+The two distributions are cleanly separable (flu's max 0.637 sits below covid/rsv's min
+0.727, a ~0.09 gap) - `REPORT_RELEVANCE_MAX_DISTANCE = 0.68` sits in the middle of that
+gap, ~0.04 of margin on each side. `app.db.filter_relevant()` (pure function, no DB
+access) drops any match above this threshold; it's applied in `run_agent_cycle()` right
+after `search_similar_reports()`, before results reach the reasoning prompt. The
+dashboard's free-text `/reports/search` box is deliberately left unfiltered - it already
+shows raw `distance`/`similarity_pct` to the user for self-service judgment, and the
+threshold was calibrated against the agent's structured query style, not arbitrary
+free text.
+
+## First test suite (`tests/`)
+
+The repo had no tests before this. Added:
+- `tests/test_relevance_threshold.py` - fast, no DB/network: `filter_relevant()`
+  behavior on fixture distances, `build_situation_text()` output shape, and a regression
+  guard that `REPORT_RELEVANCE_MAX_DISTANCE` stays inside the empirically measured gap
+  (0.637, 0.727).
+- `tests/test_relevance_threshold_integration.py` - real DB + real local embedding
+  model: re-derives best-match distances live and asserts flu queries clear the
+  threshold while covid/rsv queries get filtered to zero matches. Slower (~2 min, loads
+  the embedding model and makes real vector-search round trips) but verifies the actual
+  empirical claim, not just the filtering logic in isolation.
+- `pytest` added to `requirements.txt`. Run with `python -m pytest tests/ -v` from the
+  repo root. Both files ran clean (9/9 passing) against the real CockroachDB Cloud
+  cluster during this change.
+
+## Historical demo alerts regenerated
+
+The 9 historical/demo alerts (as opposed to the 1 alert generated from a genuinely
+current run) were all generated under the old numeric query construction, so their
+`agent_reasoning.matched_reports` cited "similar" flu reports for covid/rsv alerts -
+inconsistent with the fixed retrieval behavior above. Deleted those 9 alerts and their
+`alert_state_transitions` rows, then reran `run_agent_cycle()` for the same
+(signal_type, region, as_of_date) triples so `observed_date` and severity are unchanged
+(both are deterministic from the underlying signal data, not from retrieval) but the
+reasoning trace is now consistent with current code: the 5 covid/rsv alerts now correctly
+show 0 matched reports (down from 3), the 2 flu alerts still show 3 genuine matches.
+The 1 current/live alert (`covid19_hospitalization`/California/2026-08-08) was
+regenerated too (same underlying data, z-score 1.94, severity `watch` - only the
+retrieval trace changed, now 0 matched reports instead of 3 fabricated ones). All 10
+alerts in the live database are now consistent with the fixed retrieval code.
+
+## Caveat: 0.68 is corpus-specific, not a general relevance threshold
+
+`REPORT_RELEVANCE_MAX_DISTANCE = 0.68` was derived against a `health_reports` corpus
+that is 100% flu narrative text. Part of why flu queries land closer than covid/rsv
+queries is genuine topical relevance - but part of it may just be vocabulary/register
+overlap: a flu query and a flu corpus share phrasing ("influenza", "specimens testing
+positive", etc.) that a covid/rsv query, built from the same sentence template, doesn't.
+This threshold has not been validated against a corpus that actually contains covid/rsv
+content, so it isn't known whether 0.68 would still separate "genuinely relevant" from
+"not relevant" in that case, or whether it's really separating "flu-corpus-shaped text"
+from "not flu-corpus-shaped text." If covid/rsv narrative reports are ever added to
+`health_reports` (there is no such CDC source in the current locked scope - see section
+4), this threshold must be re-derived from scratch against the new mixed corpus, not
+assumed to still hold - re-run the same measurement `tests/test_relevance_threshold_integration.py`
+does, now with genuine covid/rsv positives possible, before trusting the number again.

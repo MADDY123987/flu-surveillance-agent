@@ -1,6 +1,6 @@
 import json
 from sqlalchemy import create_engine, text
-from app.config import DATABASE_URL
+from app.config import DATABASE_URL, REPORT_RELEVANCE_MAX_DISTANCE
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -107,6 +107,18 @@ def search_similar_reports(embedding: list[float], limit: int = 3, actor: str = 
         ).fetchall()
     log_audit(actor, "read", "health_reports:vector_search", {"results": len(rows)})
     return [{"title": r[0], "content": r[1], "published_date": str(r[2]), "distance": r[3]} for r in rows]
+
+
+def filter_relevant(matches: list[dict], max_distance: float = REPORT_RELEVANCE_MAX_DISTANCE) -> list[dict]:
+    """
+    Drops nearest-neighbor matches that aren't actually relevant, just least-bad. Vector
+    search always returns its top-k even when nothing in memory is a genuine match (e.g. a
+    covid/rsv query against health_reports, which only holds flu narrative text) - without
+    this, the agent would cite a flu report as "similar historical context" for a covid
+    alert. max_distance is empirically derived - see REPORT_RELEVANCE_MAX_DISTANCE in
+    app/config.py for the flu vs covid/rsv distance distributions behind the cutoff.
+    """
+    return [m for m in matches if m["distance"] <= max_distance]
 
 
 def insert_alert(signal_type: str, region: str, severity: str, message: str, reasoning: dict, observed_date: str) -> str:

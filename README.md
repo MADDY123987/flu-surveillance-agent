@@ -29,7 +29,9 @@ baseline, and without a baseline there is no way to say whether this week matter
 Every 4 hours it ingests three real CDC sources, stores them in CockroachDB, and runs a
 five-step reasoning loop that produces auditable, explained alerts.
 
-**Regions:** US National, California, Texas, New York
+**Regions:** US National + California, Texas, New York, Colorado, Georgia, Maryland,
+Michigan, Minnesota, New Mexico, Tennessee (11 total — empirically selected; see
+HANDOFF.md section 4 for the RESP-NET/ILINet coverage check behind the list)
 **Signals:** influenza-like illness (ILINet), COVID-19 and RSV hospitalization rates
 (RESP-NET), plus CDC FluView weekly narrative reports
 

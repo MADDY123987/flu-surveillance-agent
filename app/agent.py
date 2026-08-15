@@ -10,7 +10,7 @@ and decide -> store the alert (or not) with its full reasoning trace.
 import json
 from groq import Groq
 from app.config import GROQ_API_KEY, GROQ_MODEL, TARGET_REGIONS, TARGET_SIGNAL
-from app.db import get_recent_signals, search_similar_reports, insert_alert
+from app.db import get_recent_signals, search_similar_reports, insert_alert, filter_relevant
 from app.embeddings import embed_text
 from app.features import compute_features, is_stale, MIN_BASELINE_OBSERVATIONS
 
@@ -61,6 +61,35 @@ def determine_severity(z_score: float | None, direction: str) -> tuple[str, str]
 REPORT_SNIPPET_CHARS = 400  # keep the prompt within Groq's TPM limits - full text already
                              # did its job in the vector search step; only a snippet is
                              # needed here for the model to write 1-2 sentences of context
+
+# Human-readable phrasing for each signal_type, used to build the retrieval query below.
+SIGNAL_DESCRIPTIONS = {
+    "flu_like_illness": "influenza-like illness activity",
+    "covid19_hospitalization": "COVID-19 hospitalization rate",
+    "rsv_hospitalization": "RSV hospitalization rate",
+}
+
+
+def build_situation_text(signal_type: str, region: str, latest: dict, features: dict, direction: str) -> str:
+    """
+    Builds the text that gets embedded to query health_reports for similar past situations.
+
+    Previously this was a bare numeric statement ("flu_like_illness in California was 1.6
+    as of 2026-08-01") - semantically close to nothing, since health_reports holds CDC
+    narrative prose (see a real excerpt in app/seed_reports.py/HANDOFF.md), not numbers.
+    This instead writes a short surveillance-style sentence - the same register FluView's
+    narrative reports use - so a genuinely relevant flu report has a real chance to be the
+    nearest neighbor instead of winning only because everything else is equally far away.
+    """
+    signal_label = SIGNAL_DESCRIPTIONS.get(signal_type, signal_type.replace("_", " "))
+    wow = features.get("week_over_week_pct_change")
+    z = features.get("z_score")
+    trend = f"{direction} relative to its recent baseline" if direction != "neutral" else "steady relative to its recent baseline"
+    detail = f" (week-over-week change {wow}%, z-score {z})" if wow is not None and z is not None else ""
+    return (
+        f"Surveillance update: {signal_label} in {region} is {trend}, "
+        f"currently at {latest['value']} as of {latest['date']}{detail}."
+    )
 
 
 def reason_and_decide(region: str, signal_type: str, recent: list[dict], features: dict, similar_reports: list[dict]) -> dict:
@@ -152,15 +181,21 @@ def run_agent_cycle(region: str, signal_type: str, as_of_date: str | None = None
     trace["steps"].append({"step": "freshness_check", "stale": False, "latest_date": latest["date"]})
 
     # Step 3: describe the situation and embed it
-    situation_text = f"{signal_type} in {region} was {latest['value']} as of {latest['date']}"
+    direction = determine_direction(features.get("z_score"))
+    situation_text = build_situation_text(signal_type, region, latest, features, direction)
     embedding = embed_text(situation_text)
     trace["steps"].append({"step": "embed_situation", "text": situation_text})
 
-    # Step 4: search memory for similar past situations
-    similar_reports = search_similar_reports(embedding)
+    # Step 4: search memory for similar past situations, then drop anything that isn't
+    # actually relevant (see REPORT_RELEVANCE_MAX_DISTANCE in app/config.py) - health_reports
+    # only contains flu narrative text, so a covid/rsv query has no genuine match available
+    # and should come back empty rather than citing the least-bad flu report as if relevant.
+    raw_matches = search_similar_reports(embedding)
+    similar_reports = filter_relevant(raw_matches)
     trace["steps"].append({
         "step": "search_historical_context",
         "matches": len(similar_reports),
+        "candidates_considered": len(raw_matches),
         "matched_reports": [
             {"title": r["title"], "published_date": r["published_date"], "distance": r["distance"]}
             for r in similar_reports

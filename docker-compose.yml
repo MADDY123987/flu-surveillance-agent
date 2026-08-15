@@ -1,0 +1,26 @@
+services:
+  crdb:
+    image: cockroachdb/cockroach:latest
+    command: start-single-node --insecure --store=type=mem,size=0.25
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "-e", "SELECT 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "26257:26257"  # host access for debugging with psql/cockroach sql, not required by the app
+
+  app:
+    build: .
+    env_file: .env  # GROQ_API_KEY, GROQ_MODEL, EMBEDDING_MODEL_NAME, TARGET_REGIONS, etc.
+    environment:
+      # Overrides the .env file's DATABASE_URL (which points at the real CockroachDB
+      # Cloud cluster) with this compose stack's own local, single-node crdb service -
+      # defaultdb always exists on a fresh node, so no separate CREATE DATABASE step
+      # is needed before app/init_db.py applies the schema.
+      DATABASE_URL: cockroachdb+psycopg://root@crdb:26257/defaultdb?sslmode=disable
+    depends_on:
+      crdb:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
